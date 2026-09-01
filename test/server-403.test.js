@@ -36,7 +36,7 @@ async function post(port) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: 'x', messages: [] }),
   });
-  return { status: res.status, body: await res.text() };
+  return { status: res.status, body: await res.text(), headers: res.headers };
 }
 
 // The client never sees the credential the proxy injects, so a 403 about that
@@ -126,8 +126,8 @@ test('with every account refused the error names all of them', async () => {
 // The mixed fleet: one credential is refused, the other account is merely out of
 // quota. A reset will still serve this request, so the refusal must not short —
 // circuit the exhaustion path — otherwise one bad credential turns every
-// recoverable exhaustion into a hard 502 and skips the holdSeconds wait that an
-// unattended run depends on.
+// recoverable exhaustion into a hard credential 502. The terminal answer is the
+// sanitized retryable 503 carrying the quota window, not the credential error.
 test('a refusal alongside a merely-exhausted account still reports exhaustion', async () => {
   const upstream = http.createServer((req, res) => {
     if (req.headers.authorization === 'Bearer ta') {
@@ -157,9 +157,10 @@ test('a refusal alongside a merely-exhausted account still reports exhaustion', 
   const proxyPort = await listen(proxy);
 
   try {
-    const { status, body } = await post(proxyPort);
-    assert.equal(status, 429, 'quota exhaustion, not a hard credential error');
-    assert.match(body, /rate_limit_error/);
+    const { status, body, headers } = await post(proxyPort);
+    assert.equal(status, 503, 'recoverable capacity failure, not a hard credential error');
+    assert.match(body, /overloaded_error/);
+    assert.equal(headers.get('retry-after'), '300', 'the quota window backs the client off');
   } finally {
     proxy.close();
     upstream.close();

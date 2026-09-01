@@ -48,14 +48,15 @@ async function runAgainstThrottlingUpstream(retryAfterHeader) {
 }
 
 // Regression: a persistently rate-limited upstream must terminate (bounded
-// retries), not loop forever tying up the client connection. A rate-limit 429
-// does NOT rotate/throttle the account (#84) — it pauses it (so concurrent
-// requests wait) and retries the same account, then surfaces a 429.
+// retries), not loop forever tying up the client connection. A short-throttle
+// 429 is retried on the same account behind the proxy (hidden from the
+// client), then the bounded pool policy runs out and a retryable 503 is
+// surfaced instead of a raw 429 that would stop the client session.
 test('persistent upstream 429 terminates with a bounded number of retries', async () => {
   const { status, upstreamHits, accountStatus, paused } = await runAgainstThrottlingUpstream('1');
-  assert.equal(status, 429);                                   // returns 429 instead of hanging
-  assert.ok(upstreamHits >= 1 && upstreamHits <= 4, `expected bounded retries, got ${upstreamHits}`);
-  assert.equal(accountStatus, 'active');                       // NOT throttled — no rotation on a rate-limit 429
+  assert.equal(status, 503);                                   // sanitized capacity failure, never a raw 429
+  assert.ok(upstreamHits >= 2 && upstreamHits <= 8, `expected bounded retries, got ${upstreamHits}`);
+  assert.equal(accountStatus, 'active');                       // a short throttle is not durable exhaustion
   assert.ok(paused, 'account should be paused, so concurrent requests wait');
 });
 
@@ -63,14 +64,15 @@ test('persistent upstream 429 terminates with a bounded number of retries', asyn
 // it would make setTimeout return immediately (and previously mark the account
 // rate-limited in the past, reactivating it instantly).
 test('negative Retry-After is clamped and still terminates', async () => {
-  const { status, upstreamHits, accountStatus, paused } = await runAgainstThrottlingUpstream('-1');
-  assert.equal(status, 429);
-  assert.ok(upstreamHits >= 1 && upstreamHits <= 4, `expected bounded retries, got ${upstreamHits}`);
+  const { status, upstreamHits, accountStatus } = await runAgainstThrottlingUpstream('-1');
+  assert.equal(status, 503);
+  assert.ok(upstreamHits >= 2 && upstreamHits <= 8, `expected bounded retries, got ${upstreamHits}`);
+  // A clamped-to-zero window leaves nothing to pause; the account must simply
+  // stay usable instead of being benched by a timestamp in the past.
   assert.equal(accountStatus, 'active');
-  assert.ok(paused);
 });
 
-test('long upstream Retry-After is surfaced without sleeping in client request', async () => {
+test('long upstream Retry-After terminates promptly without sleeping', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
@@ -104,21 +106,23 @@ test('long upstream Retry-After is surfaced without sleeping in client request',
     }
 
     await res.text();
-    assert.equal(res.status, 429);
+    assert.equal(res.status, 503, 'sanitized capacity failure instead of a raw 429');
+    assert.equal(res.headers.get('retry-after'), '300', 'a valid upstream Retry-After is preserved');
     assert.equal(upstreamHits, 1, 'long Retry-After should not be retried inline');
     assert.ok(Date.now() - started < 2000, 'request should not sleep for upstream retry window');
-    assert.equal(am.accounts[0].status, 'active', 'rate-limit 429 must not throttle/rotate the account');
-    assert.ok(am.accounts[0].pausedUntil > Date.now(), 'account should be paused so concurrent requests wait');
+    assert.equal(am.accounts[0].status, 'throttled', 'a long Retry-After benches the account until its window');
+    assert.ok(am.accounts[0].rateLimitedUntil > Date.now(), 'the bench must carry the upstream window');
   } finally {
     proxy.close();
     upstream.close();
   }
 });
 
-// A rate-limit 429 (no quota-rejected status) must NOT rotate to another
-// account — every retry stays on the same one (#84: rotating just moves the
-// burst and drops the KV cache).
-test('a rate-limit 429 never rotates to another account', async () => {
+// A short-throttle 429 (no quota-rejected status) first burns its bounded
+// same-account retry budget (the sticky account keeps its provider-side prompt
+// cache), and only then fails over to the other usable account instead of
+// surfacing the throttle to the client.
+test('a persistent short 429 spends the same-account budget before failing over', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     seen.push(req.headers.authorization);
@@ -140,12 +144,12 @@ test('a rate-limit 429 never rotates to another account', async () => {
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     await res.text();
-    assert.equal(res.status, 429);
-    const accounts = new Set(seen);
-    assert.equal(accounts.size, 1, `all hits should be on one account, saw ${[...accounts]}`);
-    assert.equal(am.accounts[0].status, 'active', 'current account not throttled');
+    assert.equal(res.status, 503, 'terminal failure is a sanitized 503, never a raw 429');
+    const firstFailover = seen.findIndex(auth => auth !== seen[0]);
+    assert.ok(firstFailover >= 3, `same-account retry budget must be spent first, failed over after ${firstFailover} hits`);
+    assert.equal(new Set(seen).size, 2, 'both usable accounts are tried before giving up');
+    assert.equal(am.accounts[0].status, 'active', 'a short throttle is not durable exhaustion');
     assert.equal(am.accounts[1].status, 'active');
-    assert.equal(am.accounts[1].pausedUntil, null, 'the other account is untouched — no rotation');
   } finally {
     proxy.close();
     upstream.close();
