@@ -875,7 +875,9 @@ export class AccountManager {
       if (r.changed) changed = true;
       if (r.session) sessionReset.push(account);
     }
-    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
+    // Keep the current account across quota-window resets.
+    // Re-rank by reset windows only when selection is actually required;
+    // proactive switching discards the active conversation's prompt cache.
     return changed;
   }
 
@@ -956,6 +958,8 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestReset = Infinity;
+    // Break weekly-reset ties by the shared 5-hour reset.
+    let bestSessionReset = Infinity;
 
     for (let i = 0; i < this.accounts.length; i++) {
       const account = this.accounts[i];
@@ -971,10 +975,14 @@ export class AccountManager {
       // window refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
+      const sessionReset = account.quota.unified5hReset || -Infinity;
       if (priority < bestPriority ||
-          (priority === bestPriority && weeklyReset < bestReset)) {
+          (priority === bestPriority &&
+           (weeklyReset < bestReset ||
+            (weeklyReset === bestReset && sessionReset < bestSessionReset)))) {
         bestPriority = priority;
         bestReset = weeklyReset;
+        bestSessionReset = sessionReset;
         best = account;
       }
     }
