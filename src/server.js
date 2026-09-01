@@ -22,12 +22,6 @@ export const HOP_BY_HOP_HEADERS = new Set([
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
-// How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
-// on the SAME account) before surfacing a 429 + retry-after to the client. A
-// rate-limit 429 never rotates accounts (that just moves the burst); it pauses
-// the account so concurrent requests wait, then retries the same account.
-const RATE_LIMIT_ABSORB_MAX_SECONDS =
-  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
 
 // Response header names that are connection-specific and thus illegal on an
 // HTTP/2 response (Node's Http2ServerResponse.writeHead rejects them). Also
@@ -36,6 +30,321 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-connection', 'te', 'trailer',
 ]);
+
+// Hide bounded transient retries across the usable pool.
+const MANAGED_SAME_ACCOUNT_RETRIES = 2;
+const MANAGED_POOL_RETRY_ROUNDS = 2;
+const MANAGED_SHORT_429_MAX_MS = 15_000;
+const MANAGED_BACKOFF_BASE_MS = 250;
+const MANAGED_BACKOFF_MAX_MS = 2_000;
+const MANAGED_POOL_WAIT_MAX_MS = 15_000;
+const MANAGED_RETRY_DEADLINE_MS = 120_000;
+
+function managedRetryAfterMs(response) {
+  const value = response.headers.get('retry-after');
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+}
+
+function managedBackoffMs(retryOrdinal) {
+  const base = Math.min(MANAGED_BACKOFF_BASE_MS * (2 ** Math.max(0, retryOrdinal - 1)), MANAGED_BACKOFF_MAX_MS);
+  const jitterMax = Math.min(100, Math.floor(base / 5));
+  return base + Math.floor(Math.random() * (jitterMax + 1));
+}
+
+function managedMonotonicMs(ctx) {
+  return typeof ctx?.managedNow === 'function'
+    ? ctx.managedNow() : Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+function managedRemainingMs(ctx) {
+  return Math.max(0, ctx.managedRetryDeadlineAt - managedMonotonicMs(ctx));
+}
+
+function managedDeadlineExpired(ctx) {
+  return managedRemainingMs(ctx) <= 0;
+}
+
+function managedCancellationError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function managedEnsureLifecycle(res, ctx) {
+  if (ctx.managedLifecycle) return ctx.managedLifecycle;
+  const controller = new AbortController();
+  let timer = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (timer) clearTimeout(timer);
+    res.off('close', onClose);
+    res.off('finish', onFinish);
+  };
+  const abort = reason => {
+    if (!controller.signal.aborted) controller.abort(reason);
+    cleanup();
+  };
+  const onClose = () => abort(managedCancellationError(
+    'downstream client disconnected', 'TEAMCLAUDE_MANAGED_CLIENT_CLOSED'));
+  const onFinish = () => cleanup();
+  const remaining = managedRemainingMs(ctx);
+  res.once('close', onClose);
+  res.once('finish', onFinish);
+  if (res.destroyed) onClose();
+  else if (!(remaining > 0)) abort(managedCancellationError(
+    'managed retry deadline exhausted', 'TEAMCLAUDE_MANAGED_DEADLINE'));
+  else {
+    timer = setTimeout(() => abort(managedCancellationError(
+      'managed retry deadline exhausted', 'TEAMCLAUDE_MANAGED_DEADLINE')), remaining);
+    timer.unref?.();
+  }
+  ctx.managedLifecycle = { controller, signal: controller.signal, cleanup };
+  return ctx.managedLifecycle;
+}
+
+function managedAwaitLifecycle(promise, ctx, onAbort = () => undefined) {
+  const signal = ctx.managedLifecycle?.signal;
+  if (!signal) return promise;
+  promise.catch?.(() => {});
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      fn(value);
+    };
+    const abort = () => {
+      try { Promise.resolve(onAbort()).catch(() => {}); } catch { /* best effort */ }
+      finish(reject, signal.reason || managedCancellationError(
+        'managed request cancelled', 'TEAMCLAUDE_MANAGED_CANCELLED'));
+    };
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(value => finish(resolve, value), error => finish(reject, error));
+  });
+}
+
+async function managedAwaitAccountOperation(operation, res, ctx) {
+  try {
+    await managedAwaitLifecycle(Promise.resolve(operation), ctx);
+    return true;
+  } catch (error) {
+    const reason = ctx.managedLifecycle?.signal.reason;
+    if (!ctx.managedLifecycle?.signal.aborted) throw error;
+    if (res.destroyed || reason?.code === 'TEAMCLAUDE_MANAGED_CLIENT_CLOSED') return false;
+    const failure = managedDeadlineFailure();
+    ctx.managedLastFailure = failure;
+    ctx.status = failure.status;
+    managedWriteFailure(res, failure);
+    return false;
+  }
+}
+
+function managedSleep(ms, res, ctx) {
+  const remaining = managedRemainingMs(ctx);
+  const signal = ctx.managedLifecycle?.signal;
+  if (!(ms > 0)) return Promise.resolve(!res.destroyed && !signal?.aborted && remaining > 0);
+  if (res.destroyed || signal?.aborted) return Promise.resolve(false);
+  const boundedMs = Math.min(ms, remaining);
+  if (!(boundedMs > 0)) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let timer = null;
+    let settled = false;
+    const finish = ok => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(ok);
+    };
+    const onAbort = () => finish(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (res.destroyed || signal?.aborted) { finish(false); return; }
+    timer = setTimeout(() => finish(!res.destroyed && !signal?.aborted && !managedDeadlineExpired(ctx)), boundedMs);
+    timer.unref?.();
+  });
+}
+
+function managedPoolWaitMs(ctx, accountManager) {
+  const now = Date.now();
+  const monotonicNow = managedMonotonicMs(ctx);
+  const waits = [];
+  for (const notBefore of ctx.managedRetryNotBefore.values()) {
+    if (notBefore > monotonicNow) waits.push(notBefore - monotonicNow);
+  }
+  for (const account of accountManager.accounts) {
+    const quota = account.quota || {};
+    const threshold = accountManager.switchThreshold ?? 0.98;
+    const quotaResets = [
+      quota.unified5h >= threshold ? quota.unified5hReset : null,
+      quota.unified7d >= threshold ? quota.unified7dReset : null,
+      quota.unified7dSonnet >= threshold ? quota.unified7dSonnetReset : null,
+      quota.unified7dFable >= threshold ? quota.unified7dFableReset : null,
+      (quota.tokensLimit > 0 && quota.tokensRemaining / quota.tokensLimit <= 1 - threshold) ? quota.resetsAt : null,
+      (quota.requestsLimit > 0 && quota.requestsRemaining / quota.requestsLimit <= 1 - threshold) ? quota.resetsAt : null,
+    ];
+    for (const reset of [account.pausedUntil, account.rateLimitedUntil, ...quotaResets]) {
+      const at = typeof reset === 'number' ? reset : Date.parse(reset);
+      if (Number.isFinite(at) && at > now) waits.push(at - now);
+    }
+  }
+  const floor = managedBackoffMs(MANAGED_SAME_ACCOUNT_RETRIES + (ctx.managedPoolRetryRounds || 0) + 1);
+  const target = waits.length ? Math.max(floor, Math.min(...waits)) : floor;
+  const remaining = managedRemainingMs(ctx);
+  return target <= MANAGED_POOL_WAIT_MAX_MS && target < remaining ? target : null;
+}
+
+function managedHasRetryableCandidate(ctx, accountManager) {
+  return accountManager.accounts.some(account =>
+    !ctx.managedPermanentTried.has(account.index) && !account.disabled &&
+    account.status !== 'error' && account.status !== 'exhausted');
+}
+
+function managedResetPoolPass(ctx) {
+  ctx.tried.clear();
+  for (const index of ctx.managedPermanentTried) ctx.tried.add(index);
+  const now = managedMonotonicMs(ctx);
+  for (const [index, notBefore] of ctx.managedRetryNotBefore) {
+    if (notBefore > now) ctx.tried.add(index);
+  }
+}
+
+function managedErrorSignal(body) {
+  try {
+    const value = JSON.parse(body.toString('utf8'));
+    const error = value?.error || value;
+    return [value?.type, value?.code, error?.type, error?.code, error?.message]
+      .filter(v => typeof v === 'string').join(' ').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function managedQuotaOrBillingKind(status, rateLimitHeaders, body) {
+  if (status === 429 && (
+      rateLimitHeaders['anthropic-ratelimit-unified-5h-status'] === 'rejected' ||
+      rateLimitHeaders['anthropic-ratelimit-unified-7d-status'] === 'rejected')) return 'general-quota';
+  if (status === 429 &&
+      rateLimitHeaders['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected') return 'model-quota';
+  if (![400, 402, 403, 429].includes(status)) return false;
+  const signal = managedErrorSignal(body);
+  if (/(?:billing[_ -]?error|credit balance|spend(?:ing)? limit|subscription expired)/.test(signal)) return 'billing';
+  return /(?:insufficient[_ -]?quota|quota[_ -]?(?:exceeded|exhausted)|usage limit (?:has been )?(?:reached|exceeded)|subscription limit)/.test(signal)
+    ? 'unknown-quota' : null;
+}
+
+function managedPersistModelQuota(account, rateLimitHeaders, retryAfterMs) {
+  const quota = account.quota || (account.quota = {});
+  const now = Date.now();
+  const exactSeconds = Number(rateLimitHeaders['anthropic-ratelimit-unified-7d_oi-reset']);
+  const exactReset = Number.isFinite(exactSeconds) && exactSeconds * 1000 > now
+    ? Math.trunc(exactSeconds * 1000) : null;
+  const existingReset = Number.isFinite(quota.unified7dFableReset) && quota.unified7dFableReset > now
+    ? quota.unified7dFableReset : null;
+  const sharedReset = Number.isFinite(quota.unified7dReset) && quota.unified7dReset > now
+    ? quota.unified7dReset : null;
+  const fallbackReset = now + Math.max(Number.isFinite(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs : 60_000, 1_000);
+  quota.unified7dFable = Math.max(Number(quota.unified7dFable) || 0, 1);
+  quota.unified7dFableReset = exactReset || existingReset || sharedReset || fallbackReset;
+}
+
+function managedResponseHeaders(response) {
+  const headers = {};
+  for (const [key, value] of response.headers.entries()) {
+    if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+    if (key === 'content-encoding' || key === 'content-length') continue;
+    headers[key] = value;
+  }
+  return headers;
+}
+
+async function managedCaptureFailure(response, retryAfterMs = null, ctx) {
+  const chunks = [];
+  if (response.body) {
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await managedAwaitLifecycle(
+          reader.read(), ctx, () => reader.cancel());
+        if (done) break;
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      try { reader.releaseLock(); } catch { /* already released/cancelled */ }
+    }
+  }
+  const body = Buffer.concat(chunks);
+  return { status: response.status, headers: managedResponseHeaders(response), body, retryAfterMs };
+}
+
+function managedTransportFailure() {
+  return {
+    status: 502,
+    headers: { 'Content-Type': 'application/json' },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: { type: 'proxy_error', message: 'Managed upstream transport failed after exhausting the usable account pool.' },
+    })),
+  };
+}
+
+function managedDeadlineFailure() {
+  return {
+    status: 504,
+    headers: { 'Content-Type': 'application/json' },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: { type: 'timeout_error', message: 'Managed upstream retry deadline exhausted.' },
+    })),
+  };
+}
+
+function managedCredentialFailure() {
+  return {
+    status: 502,
+    headers: { 'Content-Type': 'application/json' },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: { type: 'proxy_error', message: 'Managed upstream credentials were unavailable across the usable account pool.' },
+    })),
+  };
+}
+
+function managedCapacityFailure(source = null) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (Number.isFinite(source?.retryAfterMs) && source.retryAfterMs > 0) {
+    headers['retry-after'] = String(Math.max(1, Math.ceil(source.retryAfterMs / 1000)));
+  }
+  return {
+    status: 503,
+    headers,
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: 'Managed upstream capacity remained unavailable after exhausting the usable account pool.' },
+    })),
+  };
+}
+
+function managedTerminalFailure(failure) {
+  if (failure?.status === 401 || failure?.status === 403) return managedCredentialFailure();
+  if (failure?.status === 429) return managedCapacityFailure(failure);
+  return failure || managedCapacityFailure();
+}
+
+function managedWriteFailure(res, failure) {
+  if (res.headersSent || res.destroyed) return;
+  res.writeHead(failure.status, failure.headers);
+  res.end(failure.body);
+}
+
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
 // gate use it). Returns false on any type/length mismatch without leaking timing.
@@ -723,7 +1032,22 @@ function formatHeaders(headers) {
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
-  const maxRetries = accountManager.accounts.length;
+  ctx.managedSameAccountRetries ??= new Map();
+  ctx.managedFrozenRequests ??= new Map();
+  ctx.managedPermanentTried ??= new Set();
+  ctx.managedRetryNotBefore ??= new Map();
+  ctx.managedRetryAccountIndex ??= null;
+  ctx.managedLastFailure ??= null;
+  ctx.managedRetryDeadlineAt ??= managedMonotonicMs(ctx) + MANAGED_RETRY_DEADLINE_MS;
+  const managedLifecycle = managedEnsureLifecycle(res, ctx);
+  if (managedDeadlineExpired(ctx) || managedLifecycle.signal.aborted) {
+    if (res.destroyed || managedLifecycle.signal.reason?.code === 'TEAMCLAUDE_MANAGED_CLIENT_CLOSED') return;
+    const failure = managedDeadlineFailure();
+    ctx.managedLastFailure = failure;
+    ctx.status = failure.status;
+    managedWriteFailure(res, failure);
+    return;
+  }
   // This function is exported, so a caller may hand us a ctx built elsewhere.
   // The 401 path reads ctx.reauthed on every response; default it here rather
   // than trusting every construction site to include it.
@@ -733,17 +1057,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
   // Select account, skipping any already tried (and failed) this request.
-  // The model scopes availability so a Fable-exhausted account is skipped only
-  // for Fable requests (it still serves other models).
-  // A pinned request (via /tc-acct/<name>) forces one exact account and never
-  // rotates or fails over: once that account has been tried, `account` is null
-  // and the caller gets the exhausted response rather than leaking to another.
-  const account = ctx.pinnedIndex != null
-    ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+  // A hidden same-account retry is an explicit one-shot preference. It is
+  // consumed here so any later recursion must deliberately request it again.
+  const managedRetryIndex = ctx.managedRetryAccountIndex;
+  ctx.managedRetryAccountIndex = null;
+  let account = managedRetryIndex == null ? null : accountManager.accounts[managedRetryIndex];
+  if (account && (ctx.tried.has(account.index) || account.disabled ||
+      account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled' ||
+      (ctx.managedRetryNotBefore.get(account.index) || 0) > managedMonotonicMs(ctx))) {
+    ctx.tried.add(account.index);
+    account = null;
+  }
   if (!account) {
-    // Every candidate was refused by upstream (403). Waiting will not help — the
-    // account needs attention, not a retry — so say so plainly rather than
+    // The model scopes availability so a spent model-family bucket does not
+    // unnecessarily remove an otherwise healthy account from the pool.
+    account = ctx.pinnedIndex != null
+      ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
+      : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+  }
+  if (!account) {
+    // Every candidate was refused by upstream (403). Waiting will not help — the    // account needs attention, not a retry — so say so plainly rather than
     // reporting a rate limit. Not a 403 either: the client's own credential is
     // fine, and a 403 would make it drop its login over someone else's problem.
     //
@@ -770,8 +1103,35 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       return;
     }
-    // A pinned request concerns exactly one account: don't compute a fleet-wide
-    // retry-after or sleep on other accounts' windows — return immediately.
+    // A retryable failure is surfaced only after selection proves there is no
+    // other usable account left. Pinned calls may retry their one account,
+    // but must never enter a pool round or leak to another account.
+    ctx.managedLastFailure ||= managedCapacityFailure();
+    if (ctx.managedLastFailure) {
+      const poolRound = ctx.managedPoolRetryRounds || 0;
+      const waitMs = managedPoolWaitMs(ctx, accountManager);
+      if (ctx.pinnedIndex == null &&
+          managedHasRetryableCandidate(ctx, accountManager) &&
+          poolRound < MANAGED_POOL_RETRY_ROUNDS && waitMs != null) {
+        ctx.managedPoolRetryRounds = poolRound + 1;
+        console.log(`[TeamClaude] Usable pool exhausted — hidden pool retry ${poolRound + 1}/${MANAGED_POOL_RETRY_ROUNDS} in ${waitMs}ms`);
+        if (!await managedSleep(waitMs, res, ctx)) {
+          if (!res.destroyed) {
+            ctx.managedLastFailure = managedDeadlineFailure();
+            managedWriteFailure(res, ctx.managedLastFailure);
+          }
+          return;
+        }
+        managedResetPoolPass(ctx);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      const terminalFailure = managedTerminalFailure(ctx.managedLastFailure);
+      ctx.status = terminalFailure.status;
+      ctx.account = '(managed retry pool exhausted)';
+      managedWriteFailure(res, terminalFailure);
+      return;
+    }
+    // A pinned request concerns exactly one account: don't compute a fleet-wide    // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
       ctx.status = 429;
       ctx.account = '(pinned account unavailable)';
@@ -835,51 +1195,82 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
-  await accountManager.ensureTokenFresh(account.index);
-  if (account.status === 'error' && retryCount < maxRetries) {
+  if (!await managedAwaitAccountOperation(accountManager.ensureTokenFresh(account.index), res, ctx)) return;
+  if (account.status === 'error') {
+    (ctx.credentialRejected ??= new Set()).add(account.name);
+    ctx.managedPermanentTried.add(account.index);
     ctx.tried.add(account.index);
     return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
-  // Build upstream request headers
-  const isOAuth = account.type === 'oauth';
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    // HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) live in
-    // req.headers on the h2 server path; fetch rejects `:`-prefixed names.
-    if (lk.startsWith(':')) continue;
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
-    // Strip accept-encoding: Node fetch auto-decompresses, which would
-    // mismatch the Content-Encoding header we forward to the client
-    if (lk === 'accept-encoding') continue;
-    headers[key] = value;
+  // Freeze one normalized request per account before its first upstream attempt.
+  // Every later retry/pool round on that account reuses the exact bytes and
+  // header values; only router-owned authentication changes. Cross-account
+  // failover may need that account's UUID/model map, while the prompt-cache
+  // content, history and tool ordering remain byte-for-byte stable per account.
+  if (!ctx.managedFrozenRequests.has(account.index)) {
+    const frozenHeaders = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lk = key.toLowerCase();
+      if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk)) continue;
+      if (lk === 'x-api-key' || lk === 'authorization' || lk === 'accept-encoding') continue;
+      frozenHeaders[key] = value;
+    }
+    let frozenBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
+    if (account.accountUuid) frozenBody = patchAccountUuid(frozenBody, account.accountUuid);
+    if (account.modelMap) frozenBody = rewriteModel(frozenBody, account.modelMap);
+    if (frozenBody !== body) frozenHeaders['content-length'] = String(frozenBody.length);
+    ctx.managedFrozenRequests.set(account.index, Object.freeze({
+      method: req.method,
+      body: frozenBody,
+      headers: Object.freeze({ ...frozenHeaders }),
+    }));
   }
 
-  if (isOAuth) {
-    headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
-    headers['x-api-key'] = account.credential;
-  }
-
+  const managedFrozenRequest = ctx.managedFrozenRequests.get(account.index);
+  const method = managedFrozenRequest.method;
+  const sendBody = managedFrozenRequest.body;
+  const headers = { ...managedFrozenRequest.headers };
+  if (account.type === 'oauth') headers.authorization = `Bearer ${account.credential}`;
+  else headers['x-api-key'] = account.credential;
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
-  const method = req.method;
 
-  // Strip orphaned tool_use / tool_result blocks so a client that compacted or
-  // interrupted a turn can't wedge the session with Anthropic's non-retryable
-  // 400 ("tool_use ids were found without tool_result blocks"). No-op (same
-  // Buffer) for a well-formed body.
-  let sendBody = sanitizeToolPairs(body, req.url, req.headers['content-type']);
-  // Align the body's account_uuid (in metadata.user_id) with the account whose
-  // token we're injecting (same-length patch; no-op if absent).
-  if (account.accountUuid) sendBody = patchAccountUuid(sendBody, account.accountUuid);
-  // Rewrite the model name for accounts that target a different upstream (e.g.
-  // GLM), which uses different model identifiers than Anthropic.
-  if (account.modelMap) sendBody = rewriteModel(sendBody, account.modelMap);
-  // If the body changed length (sanitize or model rewrite), update Content-Length
-  // so the upstream doesn't receive a mismatched framing and truncate or stall.
-  if (sendBody !== body) headers['content-length'] = String(sendBody.length);
+  const retryManagedFailure = async (failure, retryAfterMs = null) => {
+    failure.retryAfterMs = Number.isFinite(retryAfterMs) ? retryAfterMs : null;
+    ctx.managedLastFailure = failure;
+    if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+      ctx.managedRetryNotBefore.set(account.index, managedMonotonicMs(ctx) + retryAfterMs);
+    }
+    const completed = ctx.managedSameAccountRetries.get(account.index) || 0;
+    const remaining = managedRemainingMs(ctx);
+    const retryAfterIsShort = retryAfterMs == null ||
+      (retryAfterMs <= MANAGED_SHORT_429_MAX_MS && retryAfterMs < remaining);
+    if (completed < MANAGED_SAME_ACCOUNT_RETRIES && retryAfterIsShort &&
+        !res.headersSent && !res.destroyed && remaining > 0) {
+      const next = completed + 1;
+      ctx.managedSameAccountRetries.set(account.index, next);
+      ctx.managedRetryAccountIndex = account.index;
+      const waitMs = retryAfterMs == null ? managedBackoffMs(next) : retryAfterMs;
+      console.log(`[TeamClaude] Retryable upstream failure on "${account.name}" — hidden retry ${next}/${MANAGED_SAME_ACCOUNT_RETRIES} in ${waitMs}ms`);
+      if (!await managedSleep(waitMs, res, ctx)) {
+        if (!res.destroyed) {
+          ctx.managedLastFailure = managedDeadlineFailure();
+          managedWriteFailure(res, ctx.managedLastFailure);
+        }
+        return;
+      }
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+    ctx.managedSameAccountRetries.set(account.index, MANAGED_SAME_ACCOUNT_RETRIES);
+    ctx.managedRetryAccountIndex = null;
+    ctx.tried.add(account.index);
+    if (res.headersSent || res.destroyed) {
+      if (!res.writableEnded) res.destroy();
+      return;
+    }
+    console.log(`[TeamClaude] Retry budget exhausted on "${account.name}" — trying another usable account`);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+  };
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
@@ -904,7 +1295,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => res.destroyed)) return;
+    if (!await accountManager.admit(account.index, () => res.destroyed || managedLifecycle.signal.aborted || managedDeadlineExpired(ctx))) {
+      if (!res.destroyed) {
+        ctx.managedLastFailure = managedDeadlineFailure();
+        ctx.status = ctx.managedLastFailure.status;
+        managedWriteFailure(res, ctx.managedLastFailure);
+      }
+      return;
+    }
     let upstreamRes;
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -912,6 +1310,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         headers,
         body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
         redirect: 'manual',
+        signal: managedLifecycle.signal,
+        headersTimeoutMs: Math.max(1, managedRemainingMs(ctx)),
       }, sx, route);
     } finally {
       accountManager.release(account.index);
@@ -931,92 +1331,82 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
 
-    // Two kinds of 429 are handled differently below: a quota rejection rotates
-    // to another account; a transient rate-limit throttle pauses + retries the
-    // same account (never rotates — see #84).
-    if (upstreamRes.status === 429) {
-      // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
-      // and out-of-range values are bounded to [1, 300]. A negative value would
-      // otherwise bypass the wait cap — setTimeout returns immediately and a
-      // pause/hold would be armed in the past.
-      let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
-      if (Number.isNaN(retryAfter)) retryAfter = 60;
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+    // Buffer only statuses whose structured body can identify account-specific
+    // quota/billing. TeamClaude's fetch shim has a single-consumer body (no
+    // Response.clone), so permanent errors are relayed from this exact capture.
+    const managedRetryAfter = managedRetryAfterMs(upstreamRes);
+    const managedErrorFailure = [400, 402, 403, 429].includes(upstreamRes.status)
+      ? await managedCaptureFailure(upstreamRes, managedRetryAfter, ctx) : null;
+    const quotaOrBillingKind = managedQuotaOrBillingKind(
+      upstreamRes.status, rateLimitHeaders, managedErrorFailure?.body || Buffer.alloc(0));
 
-      // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
-      // status means a quota bucket is spent, so waiting and retrying the SAME
-      // account is futile — switch to another account now (updateQuota above
-      // already recorded the spent bucket's utilization from the headers).
-      const rl = rateLimitHeaders;
-      const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
-        || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected';
-      const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
-      if ((generalRejected || fableRejected) && retryCount < maxRetries) {
-        // A Fable-only rejection leaves the account fine for other models, so we
-        // do NOT throttle it globally — the recorded Fable utilization makes
-        // selection skip it for Fable requests only. A general rejection spends a
-        // shared bucket, so hold the whole account for its reset window.
-        if (fableRejected) {
-          console.log(`[TeamClaude] Fable weekly exhausted on "${account.name}" — switching account for this Fable request`);
-        } else {
-          const hold = Math.min(Math.max(retryAfter, 1), 3600);
-          console.log(`[TeamClaude] Quota rejection (429) on "${account.name}" — throttling ${hold}s and switching account`);
-          accountManager.markRateLimited(account.index, hold);
-        }
-        ctx.tried.add(account.index);
-        if (res.destroyed) return;
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    if (quotaOrBillingKind && !res.headersSent) {
+      ctx.managedLastFailure = managedErrorFailure;
+      if (quotaOrBillingKind === 'model-quota') {
+        managedPersistModelQuota(account, rateLimitHeaders, managedRetryAfter);
+      } else if (quotaOrBillingKind === 'general-quota' || quotaOrBillingKind === 'billing') {
+        const holdSeconds = Math.min(Math.max(Math.ceil((managedRetryAfter ?? 3_600_000) / 1000), 1), 3600);
+        accountManager.markRateLimited(account.index, holdSeconds);
       }
+      ctx.managedSameAccountRetries.set(account.index, MANAGED_SAME_ACCOUNT_RETRIES);
+      ctx.managedPermanentTried.add(account.index);
+      ctx.tried.add(account.index);
+      console.log(`[TeamClaude] Confirmed quota/billing rejection on "${account.name}" — switching account`);
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
 
-      retryAfter = Math.min(Math.max(retryAfter, 1), 300);
+    if (upstreamRes.status === 403 && !res.headersSent) {
+      ctx.managedLastFailure = managedErrorFailure;
+      (ctx.credentialRejected ??= new Set()).add(account.name);
+      ctx.managedPermanentTried.add(account.index);
+      ctx.tried.add(account.index);
+      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
 
-      // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
-      // 'always' is already on sx; '429' switches direct→sx now and skips the
-      // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
-      const nextUseSx = !!(sx?.useOn429());
-      const switchingToSx = nextUseSx && !route;
-      sx?.noteRateLimited(retryAfter);
-
-      // This is a rate-limit 429 (per-minute throttle), NOT quota exhaustion —
-      // quota rejection is handled above and is the only thing that rotates.
-      // Do NOT switch accounts here: moving the burst to the next account just
-      // throttles it too (thundering herd, #84) and discards this account's KV
-      // cache. Instead PAUSE this account so concurrent requests wait in admit()
-      // (capped, then released through a fresh ramp) instead of piling on, and
-      // retry the SAME account. The pause never marks the account throttled, so
-      // selection keeps choosing it.
-      accountManager.pauseAccount(account.index, Math.min(retryAfter, RATE_LIMIT_ABSORB_MAX_SECONDS));
-
-      // sx fresh-IP retry (still the same account) takes precedence over waiting.
-      // Bounded by retryCount like the inline-wait path below, so a persistently
-      // 429ing upstream can't loop forever through sx.
-      if (switchingToSx && retryCount < maxRetries) {
-        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (res.destroyed) return;
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
-      }
-
-      // Absorb short waits inline on the same account — the client never sees the
-      // 429. Bounded by retryCount (maxRetries = account count) so a persistently
-      // rate-limited account can't loop forever tying up the connection.
-      if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
-        console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (res.destroyed) return;
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
-      }
-
-      // Longer retry-after (or retries exhausted): don't hold the connection and
-      // don't rotate — surface the 429 with retry-after so the client backs off.
-      // The pause above keeps other requests off this account meanwhile.
-      console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
-      ctx.status = 429;
-      if (!res.headersSent && !res.destroyed) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
-      }
+    if ([400, 402].includes(upstreamRes.status)) {
+      ctx.status = upstreamRes.status;
+      managedWriteFailure(res, managedErrorFailure);
       return;
+    }
+
+    if (upstreamRes.status === 429) {
+      const retryAfterMs = managedRetryAfter;
+      const failure = managedErrorFailure;
+      const nextUseSx = !!(sx?.useOn429());
+      const switchingToSx = nextUseSx && !route && !ctx.managedSxRetryUsed;
+      sx?.noteRateLimited(Math.max(1, Math.ceil((retryAfterMs ?? 1_000) / 1000)));
+      if (switchingToSx) {
+        ctx.managedSxRetryUsed = true;
+        ctx.managedSameAccountRetries.set(account.index,
+          (ctx.managedSameAccountRetries.get(account.index) || 0) + 1);
+        ctx.managedRetryAccountIndex = account.index;
+        console.log(`[TeamClaude] 429 on "${account.name}" — one immediate same-account retry via sx.org`);
+        if (res.destroyed || managedLifecycle.signal.aborted) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, true);
+      }
+      const shortThrottle = retryAfterMs == null || retryAfterMs <= MANAGED_SHORT_429_MAX_MS;
+      if (shortThrottle) {
+        const pauseMs = retryAfterMs ?? managedBackoffMs((ctx.managedSameAccountRetries.get(account.index) || 0) + 1);
+        accountManager.pauseAccount(account.index, pauseMs / 1000);
+        // The retry helper waits once; pauseAccount applies the same boundary
+        // to concurrent requests and releases them through the normal ramp.
+        return retryManagedFailure(failure, retryAfterMs);
+      }
+      accountManager.markRateLimited(account.index, Math.min(Math.max(Math.ceil(retryAfterMs / 1000), 1), 3600));
+      ctx.managedLastFailure = failure;
+      ctx.managedSameAccountRetries.set(account.index, MANAGED_SAME_ACCOUNT_RETRIES);
+      ctx.tried.add(account.index);
+      console.log(`[TeamClaude] Long 429 on "${account.name}" — switching account without exposing it to Claude`);
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    if ([408, 425, 500, 502, 503, 504].includes(upstreamRes.status)) {
+      const retryAfterMs = managedRetryAfterMs(upstreamRes);
+      const failure = await managedCaptureFailure(upstreamRes, retryAfterMs, ctx);
+      return retryManagedFailure(failure, retryAfterMs);
     }
 
     // A 401 means the credential we injected was rejected. For an OAuth account
@@ -1050,14 +1440,29 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
-        && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
+        && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
-      await accountManager.ensureTokenFresh(account.index, true);
+      if (!await managedAwaitAccountOperation(accountManager.ensureTokenFresh(account.index, true), res, ctx)) return;
       if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
+
+    // A second injected-credential 401 is account-specific, not a client
+    // request error. Fail over without leaking it into Claude's login state.
+    if (upstreamRes.status === 401 && !res.headersSent) {
+      ctx.managedLastFailure = await managedCaptureFailure(upstreamRes, null, ctx);
+      (ctx.credentialRejected ??= new Set()).add(account.name);
+      ctx.managedPermanentTried.add(account.index);
+      ctx.tried.add(account.index);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    // The retry deadline ends when a terminal response is accepted. Long
+    // successful SSE streams keep their existing body-idle watchdog and
+    // must not be aborted merely because they outlive the retry window.
+    managedLifecycle.cleanup();
 
     // Log the request head (once) followed by the response headers, streaming
     // to disk from here on.
@@ -1110,49 +1515,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const l = getLog();
     if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
-    const isTransient = err instanceof Error &&
-      (err.code === 'TEAMCLAUDE_HEADERS_TIMEOUT' || err.code === 'TEAMCLAUDE_BODY_TIMEOUT' ||
-        err.name === 'TimeoutError' || err.name === 'AbortError' ||
-        err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-        err.code === 'UND_ERR_HEADERS_TIMEOUT' || err.code === 'UND_ERR_BODY_TIMEOUT');
-
-    // Transient network errors (including a stale-socket headers/body timeout):
-    // close the connection and let the client retry. Failing over to another
-    // account would not help (the poisoned fetch pool is process-wide), but the
-    // fast failure lets Node evict the dead socket so the retry reconnects
-    // cleanly. If headers were already sent (a mid-stream body timeout), destroy
-    // is the only option — the client sees a broken response and retries.
-    if (isTransient) {
-      res.destroy();
+    const managedAbortReason = managedLifecycle.signal.reason;
+    if (managedLifecycle.signal.aborted) {
+      if (res.destroyed || managedAbortReason?.code === 'TEAMCLAUDE_MANAGED_CLIENT_CLOSED') return;
+      const failure = managedDeadlineFailure();
+      ctx.managedLastFailure = failure;
+      ctx.status = failure.status;
+      managedWriteFailure(res, failure);
       return;
     }
 
-    // Any other thrown error is a transport/stream failure, NOT proof the
-    // account's credentials are bad — a bad credential comes back as a 401
-    // *response*, never a throw. So don't sideline the account (that would drop
-    // a healthy account from rotation until a credential change). Instead skip
-    // it for the rest of THIS request only and fail over to another account.
-    if (retryCount < maxRetries && !res.headersSent) {
-      ctx.tried.add(account.index);
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    // A thrown fetch/socket/TLS/timeout error is transport state, never proof
+    // that the request or account is bad. Hide bounded retries on the sticky
+    // account, then try every other usable account before surfacing failure.
+    if (!res.headersSent && !res.destroyed) {
+      return retryManagedFailure(managedTransportFailure());
     }
     ctx.status = 502;
-
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
-      }));
-    } else if (!res.writableEnded) {
-      // Error after headers were already sent (mid-stream) and it wasn't
-      // classified transient: we can't send a status or fail over, and
-      // streamResponse deliberately skipped res.end(). Destroy so the client
-      // sees a broken response and retries instead of hanging on an open socket.
-      res.destroy();
-    }
+    if (!res.writableEnded) res.destroy();
   }
 }
 
