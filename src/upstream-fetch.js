@@ -133,13 +133,22 @@ function pooledFetch(url, opts, timeoutMs) {
 // AbortController so we can arm a headers-only deadline and disarm it the moment
 // headers arrive (letting the body stream with no deadline). AbortSignal.timeout
 // can't do this — it would also kill the body.
+// Compose the caller's abort signal with the direct-fetch timeout.
 function directFetch(url, opts, timeoutMs) {
   const ctrl = new AbortController();
+  const externalSignal = opts.signal;
+  const onExternalAbort = () => ctrl.abort(externalSignal.reason);
+  if (externalSignal?.aborted) onExternalAbort();
+  else externalSignal?.addEventListener?.('abort', onExternalAbort, { once: true });
+  const cleanup = () => {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener?.('abort', onExternalAbort);
+  };
   const timer = setTimeout(() => ctrl.abort(headersTimeoutError(timeoutMs)), timeoutMs);
   timer.unref?.();
   return fetch(url, { ...opts, signal: ctrl.signal }).then(
-    (res) => { clearTimeout(timer); return res; },
-    (err) => { clearTimeout(timer); throw err; },
+    (res) => { cleanup(); return res; },
+    (err) => { cleanup(); throw err; },
   );
 }
 
