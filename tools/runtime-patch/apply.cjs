@@ -108,7 +108,8 @@ function main() {
 				`${entry.present ? "ok     " : "MISSING"}  ${entry.relativePath}  ${entry.marker}\n`,
 			);
 		}
-		process.exit(status.every((entry) => entry.present) ? 0 : 1);
+		const subscription = spawnSync(process.execPath, [path.join(__dirname, "payloads/subscription-priority.cjs"), packageRoot, "claude", "--check"], { stdio: "inherit" });
+		process.exit(status.every((entry) => entry.present) && subscription.status === 0 ? 0 : 1);
 	}
 
 	const targets = {
@@ -126,6 +127,8 @@ function main() {
 		stdio: "inherit",
 	});
 	if (applied.status !== 0) fail("the runtime patch aborted; the package was left unchanged");
+	const subscription = spawnSync(process.execPath, [path.join(__dirname, "payloads/subscription-priority.cjs"), packageRoot, "claude"], { stdio: "inherit" });
+	if (subscription.status !== 0) fail("the subscription priority patch aborted");
 
 	for (const filePath of Object.values(targets)) {
 		const checked = spawnSync(process.execPath, ["--check", filePath], { encoding: "utf8" });
