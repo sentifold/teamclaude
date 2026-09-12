@@ -75,3 +75,26 @@ update deliberately, install the new pinned version and re-run this patch.
   the payload, validates the result.
 - `payloads/teamclaude-runtime.cjs` — the patch itself, kept verbatim so it can
   be diffed against the source it was extracted from.
+
+
+### r25: opt-in subscription final-week preference
+
+The staged patch installs `subscription-priority.mjs` and hooks account selection.
+Both routers read the same machine-local Router Limits `subscriptions.json` on
+selection. Enable it with `"routingPolicy": { "mode": "final-week" }` at the top
+level. Only manual `kind: "ends"` dates qualify; renewal/period-end dates do not.
+Missing or malformed data leaves ordinary routing available.
+
+Among eligible accounts, prefer the nearest cancellation date in the last weekly
+window, falling back to seven calendar days when the reset is unknown. Date-only
+billing evidence never hard-expires an account. Exact-model limits, disablement,
+manual pins and retry exclusions remain authoritative. Operator numeric priority
+in TeamClaude still wins. Existing sessions can move on their next request;
+equal end dates preserve affinity. No request body, tier or retry code changes.
+Codex weekly reset evidence must match the exact model and be at most 15 minutes
+old; the preference never treats cached quota percentages as admission evidence.
+
+The common behavioral test accepts two staged, patched package directories:
+`node tools/runtime-patch/verify-subscription-priority.mjs /path/to/codex-multi-auth /path/to/teamclaude`.
+Dotfiles `.bin/tests/test-subscription-priority.sh` stages read-only installed
+fixtures, checks idempotency, and runs it with a private empty home.
