@@ -98,3 +98,32 @@ The common behavioral test accepts two staged, patched package directories:
 `node tools/runtime-patch/verify-subscription-priority.mjs /path/to/codex-multi-auth /path/to/teamclaude`.
 Dotfiles `.bin/tests/test-subscription-priority.sh` stages read-only installed
 fixtures, checks idempotency, and runs it with a private empty home.
+
+
+## Opus 5 blocklist (r26)
+
+The user prohibited Opus 5 on both Macs on 2026-09-17. Keep the following
+patterns in each machine-local TeamClaude config's `blockedModels`, preserving
+other entries and all account state:
+
+```json
+["*opus-5*", "*opus5*", "*opus_5*", "*opus.5*", "*5-opus*", "opus", "claude-opus", "*opus-latest*"]
+```
+
+The unversioned Opus aliases fail closed because they do not guarantee a permitted
+version. Explicit Opus 4.x and Fable remain allowed. A policy refusal is a local
+HTTP 400 with `error.code: model_blocked`, not an account outage: do not retry,
+rotate accounts, remove the rule, or silently substitute a different model.
+The user may explicitly change this policy later.
+
+r26 checks the main model, every advisor tool, JSON-escaped IDs and the effective
+per-account model map before token refresh/inference. The check applies to HTTP
+and native Claude's pinned/unpinned CONNECT TLS h1/h2 path and to retries.
+`POST /teamclaude/reload` now picks up blocklist changes; TUI edits persist them.
+The blocklist applies to traffic through TeamClaude, not direct outside traffic.
+
+Canonical patch: `sentifold/teamclaude`, `tools/runtime-patch/payloads/model-blocklist.*`.
+Dotfiles carries identical payloads in `.bin/lib`; run
+`.bin/tests/test-teamclaude-model-blocklist.sh` for offline behavior tests.
+Stage using `agent-router-setup install-runtime`; activate only TeamClaude in a
+safe maintenance window, retaining the previous immutable release for rollback.
