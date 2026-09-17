@@ -100,18 +100,18 @@ Dotfiles `.bin/tests/test-subscription-priority.sh` stages read-only installed
 fixtures, checks idempotency, and runs it with a private empty home.
 
 
-## Opus 5 blocklist (r26)
+## All Opus models blocked (r26)
 
-The user prohibited Opus 5 on both Macs on 2026-09-17. Keep the following
-patterns in each machine-local TeamClaude config's `blockedModels`, preserving
+The user prohibited the entire Opus family on both Macs on 2026-09-17. Keep the following
+pattern in each machine-local TeamClaude config's `blockedModels`, preserving
 other entries and all account state:
 
 ```json
-["*opus-5*", "*opus5*", "*opus_5*", "*opus.5*", "*5-opus*", "opus", "claude-opus", "*opus-latest*"]
+["*opus*"]
 ```
 
-The unversioned Opus aliases fail closed because they do not guarantee a permitted
-version. Explicit Opus 4.x and Fable remain allowed. A policy refusal is a local
+All Opus versions and unversioned aliases are blocked, including advisor calls.
+Fable, Sonnet and Haiku are unaffected. A policy refusal is a local
 HTTP 400 with `error.code: model_blocked`, not an account outage: do not retry,
 rotate accounts, remove the rule, or silently substitute a different model.
 The user may explicitly change this policy later.
