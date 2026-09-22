@@ -127,3 +127,28 @@ Dotfiles carries identical payloads in `.bin/lib`; run
 `.bin/tests/test-teamclaude-model-blocklist.sh` for offline behavior tests.
 Stage using `agent-router-setup install-runtime`; activate only TeamClaude in a
 safe maintenance window, retaining the previous immutable release for rollback.
+
+
+## Socket error guard (r27)
+
+TeamClaude died every few days with an uncaught `Error: read ECONNRESET at
+TCP.onStreamRead`, dropping every routed stream. Reproduced: with
+`NODE_USE_ENV_PROXY=1`, the Remote Control relays (`/v1/code/*` long-poll,
+WebSocket upgrade, absolute-form `https://` forwards) used Node's proxy-aware
+global agent. When the proxy refuses CONNECT (the smart proxy's `502 Protected
+Egress Failed`), Node 26.8.1 abandons that proxy socket: not destroyed and no
+`'error'` listener. The proxy's later reset is then fatal.
+
+`socket-error-guard.cjs` routes those relays through TeamClaude's own
+`proxyAgent`, and keeps a persistent `'error'` listener on every CONNECT tunnel
+(`connectThroughProxy`, `tunnelTls`, `proxyAgent`) for the socket's whole life.
+The owning TLS layer or HTTP client still receives the error and fails its
+request; the guard only closes the socket. As defence in depth, `crash-log.js`
+records and survives an uncaught `ECONNRESET`/`EPIPE`/`ETIMEDOUT`/`ECONNABORTED`
+read/write error whose stack lies entirely in `node:internal/stream_base_commons`
+(at most 20 a minute, logged as `tolerated stray stream error`). Every other
+uncaught exception and every unhandled rejection still exits.
+
+`node tools/runtime-patch/verify-socket-error-guard.mjs <patched package root>`
+runs the reset scenarios, each in its own loopback-only child process;
+`test/socket-error-guard.test.js` also reproduces the crash on an unpatched copy.
