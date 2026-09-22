@@ -110,7 +110,8 @@ function main() {
 		}
 		const subscription = spawnSync(process.execPath, [path.join(__dirname, "payloads/subscription-priority.cjs"), packageRoot, "claude", "--check"], { stdio: "inherit" });
 		const modelPolicy = spawnSync(process.execPath, [path.join(__dirname, "payloads/model-blocklist.cjs"), packageRoot, "--check"], { stdio: "inherit" });
-		process.exit(status.every((entry) => entry.present) && subscription.status === 0 && modelPolicy.status === 0 ? 0 : 1);
+		const socketGuard = spawnSync(process.execPath, [path.join(__dirname, "payloads/socket-error-guard.cjs"), packageRoot, "--check"], { stdio: "inherit" });
+		process.exit(status.every((entry) => entry.present) && subscription.status === 0 && modelPolicy.status === 0 && socketGuard.status === 0 ? 0 : 1);
 	}
 
 	const targets = {
@@ -132,6 +133,8 @@ function main() {
 	if (subscription.status !== 0) fail("the subscription priority patch aborted");
 	const modelPolicy = spawnSync(process.execPath, [path.join(__dirname, "payloads/model-blocklist.cjs"), packageRoot], { stdio: "inherit" });
 	if (modelPolicy.status !== 0) fail("the model blocklist patch aborted");
+	const socketGuard = spawnSync(process.execPath, [path.join(__dirname, "payloads/socket-error-guard.cjs"), packageRoot], { stdio: "inherit" });
+	if (socketGuard.status !== 0) fail("the socket error guard patch aborted");
 
 	for (const filePath of Object.values(targets)) {
 		const checked = spawnSync(process.execPath, ["--check", filePath], { encoding: "utf8" });
@@ -153,7 +156,8 @@ function main() {
 		`patched ${PACKAGE_NAME}@${PINNED_VERSION} at ${packageRoot}\n` +
 			`  sticky account selection across quota-window resets\n` +
 			`  bounded hidden retries, failover and pool waits\n` +
-			`  caller abort composed with the direct-fetch headers timeout\n`,
+			`  caller abort composed with the direct-fetch headers timeout\n` +
+			`  persistent socket error guards on proxy tunnels and relays\n`,
 	);
 }
 
