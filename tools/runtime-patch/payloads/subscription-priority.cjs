@@ -14,9 +14,9 @@ const helperFile = path.join(path.dirname(file), 'subscription-priority.mjs');
 const helper = fs.readFileSync(path.join(__dirname, 'subscription-priority.mjs'), 'utf8');
 const original = fs.readFileSync(file, 'utf8');
 let next = original;
-function replace(before, after) {
-  if (next.split(before).length !== 2) throw Error(`unsupported ${provider} layout: ${before.slice(0, 70)}`);
-  next = next.replace(before, after);
+function replace(before, after, count = 1) {
+  if (next.split(before).length !== count + 1) throw Error(`unsupported ${provider} layout: ${before.slice(0, 70)}`);
+  next = next.split(before).join(after);
 }
 if (!original.includes(marker)) {
   if (check) throw Error('subscription priority missing');
@@ -30,9 +30,10 @@ if (!original.includes(marker)) {
     // Sequential / drain-first mode`);
   } else {
     next = `${marker}\nimport { readSubscriptionPriority, subscriptionRank } from './subscription-priority.mjs';\n` + next;
-    replace(`        const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));`,
-      '        const betterExists = this._preemptedBy(pinned, model, advisorModel, exclude);');
+    // TeamClaude 1.1.21 repeats the session-pin preemption in the drain walk.
+    replace(`      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));`,
+      '      const betterExists = this._preemptedBy(pinned, model, advisorModel, exclude);', 2);
     replace('  _preemptedBy(account, model = null, advisorModel = null, exclude = null) {', `  _subscriptionRanks(model) {
     const store = readSubscriptionPriority();
     const now = Date.now();

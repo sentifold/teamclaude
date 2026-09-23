@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 // The runtime patch edits an installed package, so stage one the way the
 // installer does: the shipped src/ plus package.json. This checkout's src/ is
-// the published 1.1.13 layout, so an unpatched copy reproduces the crash.
+// the published 1.1.21 layout, so an unpatched copy reproduces the crash.
 const repo = fileURLToPath(new URL('..', import.meta.url));
 const payload = join(repo, 'tools/runtime-patch/payloads/socket-error-guard.cjs');
 const verifier = join(repo, 'tools/runtime-patch/verify-socket-error-guard.mjs');

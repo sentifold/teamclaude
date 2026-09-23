@@ -125,13 +125,15 @@ const scenarios = {
     const { connects, upstreamPort } = await refusedSmartProxy();
     const { relayHttpForward } = await load('server');
     const port = await listen(http.createServer((req, res) => relayHttpForward(req, res)));
+    // TeamClaude 1.1.21 refuses loopback forward targets (4051e50), so name a
+    // host the proxy, not this machine, would resolve.
     const status = await new Promise((done, fail) => http.request(
-      { host: '127.0.0.1', port, path: `https://127.0.0.1:${upstreamPort}/fixture` },
+      { host: '127.0.0.1', port, path: `https://relay-target.invalid:${upstreamPort}/fixture` },
       (res) => { res.resume(); done(res.statusCode); },
     ).on('error', fail).end());
     assert.equal(status, 502);
     await sleep(400);
-    assert.deepEqual(connects, [`127.0.0.1:${upstreamPort}`], 'the relay must use the proxy, never a direct socket');
+    assert.deepEqual(connects, [`relay-target.invalid:${upstreamPort}`], 'the relay must use the proxy, never a direct socket');
   } },
   // The rerouted relays still work end to end through the proxy.
   'relays-through-proxy': { exit: 0, async run() {
@@ -166,7 +168,8 @@ const scenarios = {
       });
     });
     client.destroy();
-    assert.equal(connects.length, 2, 'one guarded tunnel each for the stream and the WebSocket');
+    // The upstream tunnel pool (r29) hands the stream's idle tunnel to the WebSocket.
+    assert.equal(connects.length, 1, 'the WebSocket reuses the stream\'s pooled, guarded tunnel');
     assert.ok(connects.every((target) => target === new URL(upstream).host), connects.join());
   } },
   // A tunnel handed to its consumer before the consumer listens for errors.

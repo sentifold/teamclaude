@@ -25,7 +25,7 @@ const PACKAGE_NAME = "@karpeleslab/teamclaude";
 // The patch matches exact source layouts, so it is pinned to the version it
 // was written against. A different version must be re-verified rather than
 // patched on a best-effort basis.
-const PINNED_VERSION = "1.1.13";
+const PINNED_VERSION = "1.1.21";
 
 // Every change the payload makes carries one of these marker comments. They
 // are the idempotency key AND the post-condition: a run that reports success
@@ -42,10 +42,6 @@ const MARKERS = [
 	[
 		"src/server.js",
 		"TeamClaude local policy: hide bounded transient retries across the usable pool",
-	],
-	[
-		"src/upstream-fetch.js",
-		"TeamClaude local policy: compose managed cancellation with direct-fetch timeout",
 	],
 ];
 
@@ -156,7 +152,6 @@ function main() {
 		`patched ${PACKAGE_NAME}@${PINNED_VERSION} at ${packageRoot}\n` +
 			`  sticky account selection across quota-window resets\n` +
 			`  bounded hidden retries, failover and pool waits\n` +
-			`  caller abort composed with the direct-fetch headers timeout\n` +
 			`  persistent socket error guards on proxy tunnels and relays\n`,
 	);
 }

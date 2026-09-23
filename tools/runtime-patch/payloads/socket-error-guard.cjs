@@ -6,15 +6,18 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const root = process.argv[2];
 const check = process.argv.includes('--check');
-if (!root || JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version !== '1.1.13') {
-  throw new Error('Socket error guard patch requires TeamClaude 1.1.13');
+if (!root || JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version !== '1.1.21') {
+  throw new Error('Socket error guard patch requires TeamClaude 1.1.21');
 }
 const marker = 'Managed socket error guard r27.';
+const poolMarker = 'Managed upstream tunnel pool r29.';
 function replace(source, old, value, count = 1) {
   if (source.split(old).length !== count + 1) throw new Error(`Unexpected socket-error-guard layout: ${old.trim().slice(0, 70)}`);
   return source.split(old).join(value);
 }
 
+// 1.1.21 moved every tunnel TLS handshake (sx, the upstream proxy agent) into
+// sx.js's handshakeOverTunnel, so one persistent listener there covers both.
 const patches = {
   'sx.js': {
     apply(source) {
@@ -30,50 +33,54 @@ const patches = {
     // here because reject() after resolve() is a no-op.
     sock.on('error', fail);
   });`);
-      return replace(source, `    const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); reject(err); };
-    const onOk = () => { tlsSock.removeListener('error', onErr); resolve(tlsSock); };
-    tlsSock.once('secureConnect', onOk);
-    tlsSock.once('error', onErr);`, `    // ${marker} The error listener outlives the handshake,
-    // as in connectThroughProxy; reject() after resolve() is a no-op.
-    const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); tlsSock.destroy(); sock.destroy(); reject(err); };
-    const onOk = () => resolve(tlsSock);
-    tlsSock.once('secureConnect', onOk);
-    tlsSock.on('error', onErr);`);
+      return replace(source, `    const onOk = () => { settle(); resolve(tlsSock); };`,
+        `    // ${marker} The error listener outlives the handshake,
+    // as in connectThroughProxy: a late reset runs onErr, which closes both
+    // sockets and leaves its sink behind; reject() after resolve() is a no-op.
+    const onOk = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); resolve(tlsSock); };`);
     },
-    required: ["    sock.on('error', fail);", "    tlsSock.on('error', onErr);", 'tlsSock.destroy(); sock.destroy(); reject(err);'],
-    forbidden: ["sock.removeListener('error', fail)", "tlsSock.once('error', onErr)", "tlsSock.removeListener('error', onErr)"],
+    required: ["    sock.on('error', fail);", "tlsSock.removeListener('secureConnect', onOk); resolve(tlsSock); };",
+      "    tlsSock.once('error', onErr);", "tlsSock.on('error', () => {}); tlsSock.destroy(); sock.destroy(); reject(err);"],
+    forbidden: ["sock.removeListener('error', fail)", 'const onOk = () => { settle(); resolve(tlsSock); };'],
   },
   'upstream-proxy.js': {
-    apply(source) {
-      return replace(source, `        const onErr = (err) => { tlsSock.removeListener('secureConnect', onOk); sock.destroy(); cb(err); };
-        const onOk = () => { tlsSock.removeListener('error', onErr); cb(null, tlsSock); };
-        tlsSock.once('secureConnect', onOk);
-        tlsSock.once('error', onErr);`, `        // ${marker} Keep the error listener after the
-        // handshake so a late reset closes this tunnel instead of the process;
-        // the HTTP client that owns the socket still receives the same error.
-        let settled = false;
-        const onErr = (err) => {
-          tlsSock.removeListener('secureConnect', onOk);
-          tlsSock.destroy(); sock.destroy();
-          if (!settled) { settled = true; cb(err); }
-        };
-        const onOk = () => { settled = true; cb(null, tlsSock); };
-        tlsSock.once('secureConnect', onOk);
-        tlsSock.on('error', onErr);`);
+    required: ['handshakeOverTunnel(sock, { servername: targetHost, tlsOptions })'],
+    forbidden: ["tlsSock.once('error'"],
+    pool(source) {
+      return replace(source, `export function proxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, tlsOptions = {} }) {
+  const agent = new (useTls ? https : http).Agent({ keepAlive: false });`, `// ${poolMarker} Every forwarded request built a fresh agent with
+// keep-alive off, so each one paid its own CONNECT and TLS handshake (0.3-0.6 s
+// to api.anthropic.com) through the loopback smart proxy. One keep-alive agent
+// per (proxy, target) reuses the tunnel exactly as the direct path's pooled
+// agent does; a tunnel that dies while idle leaves the pool on 'close'. Custom
+// TLS options (tests' CAs) keep a fresh, unpooled agent.
+const managedPooledProxyAgents = new Map();
+export function proxyAgent(proxy, options) {
+  if (options.tlsOptions && Object.keys(options.tlsOptions).length) return managedProxyAgent(proxy, options, false);
+  const key = [proxy.host, proxy.port, proxy.username || '', options.targetHost, options.targetPort, options.tls !== false].join('|');
+  let agent = managedPooledProxyAgents.get(key);
+  if (!agent) {
+    agent = managedProxyAgent(proxy, options, true);
+    managedPooledProxyAgents.set(key, agent);
+  }
+  return agent;
+}
+
+function managedProxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, tlsOptions = {} }, keepAlive) {
+  const agent = new (useTls ? https : http).Agent({ keepAlive });`);
     },
-    required: ["        tlsSock.on('error', onErr);", 'if (!settled) { settled = true; cb(err); }'],
-    forbidden: ["tlsSock.once('error', onErr)", "tlsSock.removeListener('error', onErr)"],
+    poolRequired: ['const managedPooledProxyAgents = new Map();', 'new (useTls ? https : http).Agent({ keepAlive });'],
   },
   'server.js': {
     apply(source) {
       source = replace(source, "import { tunnelTls } from './sx.js';\n",
         `import { tunnelTls } from './sx.js';\n// ${marker}\nimport { proxyForHost, proxyAgent } from './upstream-proxy.js';\n`);
-      source = replace(source, `      .catch((err) => cb(err));
+      source = replace(source, `      .catch((err) => cb(err, null));
     return undefined;
   };
   return agent;
 }
-`, `      .catch((err) => cb(err));
+`, `      .catch((err) => cb(err, null));
     return undefined;
   };
   return agent;
@@ -93,11 +100,11 @@ function managedRelayAgent(target) {
 `);
       source = replace(source, '  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;',
         '  const agent = useProxy ? sxAgent(sx, target.hostname) : managedRelayAgent(target);', 2);
-      return replace(source, '  const upstreamReq = transport.request(target, { method: req.method, headers }, (upstreamRes) => {',
-        '  const upstreamReq = transport.request(target, { method: req.method, headers, agent: managedRelayAgent(target) }, (upstreamRes) => {');
+      return replace(source, '  const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {',
+        '  const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket), agent: managedRelayAgent(target) }, (upstreamRes) => {');
     },
     required: ['function managedRelayAgent(target) {', "import { proxyForHost, proxyAgent } from './upstream-proxy.js';",
-      'headers, agent: managedRelayAgent(target) }'],
+      'guardedLookup(req.socket), agent: managedRelayAgent(target) }'],
     forbidden: ['sxAgent(sx, target.hostname) : undefined;'],
     count: ['sxAgent(sx, target.hostname) : managedRelayAgent(target);', 2],
   },
@@ -116,6 +123,7 @@ const STRAY_STREAM_CODES = new Set(['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNAB
 const STREAM_INTERNAL_FRAME = /^\\s*at .*\\(node:internal\\/stream_base_commons:\\d+:\\d+\\)$/;
 const STRAY_STREAM_ERRORS_PER_MINUTE = 20;
 
+/** @param {any} err */
 export function isStrayStreamError(err) {
   if (!(err instanceof Error) || !STRAY_STREAM_CODES.has(err.code)) return false;
   if (err.syscall !== 'read' && err.syscall !== 'write') return false;
@@ -124,15 +132,15 @@ export function isStrayStreamError(err) {
 }
 `);
       source = replace(source, ` * would leave the proxy running on unknown state.
- */`, ` * would leave the proxy running on unknown state. The one exception is a stray
+ * @param {string} path`, ` * would leave the proxy running on unknown state. The one exception is a stray
  * stream error (see isStrayStreamError), which is recorded and survived.
- */`);
+ * @param {string} path`);
       source = replace(source, `export function installCrashHandlers(path, { exit = process.exit, log = process.stderr } = {}) {
-  const report = (kind) => (err) => {
+  const report = (/** @type {string} */ kind) => (/** @type {any} */ err) => {
     const stack = err?.stack || String(err);`, `export function installCrashHandlers(path, { exit = process.exit, log = process.stderr } = {}) {
   let strayWindowStart = 0;
   let strayInWindow = 0;
-  const report = (kind) => (err) => {
+  const report = (/** @type {string} */ kind) => (/** @type {any} */ err) => {
     if (kind === 'uncaughtException' && isStrayStreamError(err)) {
       const now = Date.now();
       if (now - strayWindowStart >= 60_000) { strayWindowStart = now; strayInWindow = 0; }
@@ -144,7 +152,7 @@ export function isStrayStreamError(err) {
     record(kind, err);
     exit(1);
   };
-  const record = (kind, err) => {
+  const record = (/** @type {string} */ kind, /** @type {any} */ err) => {
     const stack = err?.stack || String(err);`);
       return replace(source, `    log.write(entry);
     exit(1);
@@ -161,11 +169,15 @@ const sources = new Map();
 for (const [filename, patch] of Object.entries(patches)) {
   const file = path.join(root, 'src', filename);
   let source = fs.readFileSync(file, 'utf8');
-  if (!source.includes(marker)) {
+  if (patch.apply && !source.includes(marker)) {
     if (check) throw new Error(`${filename}: socket error guard patch missing`);
     source = patch.apply(source);
   }
-  const incomplete = patch.required.filter((value) => !source.includes(value))
+  if (patch.pool && !source.includes(poolMarker)) {
+    if (check) throw new Error(`${filename}: upstream tunnel pool patch missing`);
+    source = patch.pool(source);
+  }
+  const incomplete = patch.required.concat(patch.poolRequired || []).filter((value) => !source.includes(value))
     .concat(patch.forbidden.filter((value) => source.includes(value)));
   if (patch.count && source.split(patch.count[0]).length !== patch.count[1] + 1) incomplete.push(patch.count[0]);
   if (incomplete.length) throw new Error(`${filename}: incomplete socket error guard: ${incomplete.join(' | ')}`);
