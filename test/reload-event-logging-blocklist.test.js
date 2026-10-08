@@ -159,3 +159,34 @@ test('reload restores the defaults when both keys are removed from disk', async 
     assert.deepEqual(status.blockedModels, []);
   });
 });
+
+// The advisor opt-in is read per request beside the list, so it must follow
+// the same reload.
+test('reload hot-applies a blockedModelsMatchAdvisor edit, and its removal', async () => {
+  await withServer(async ({ hits, proxyPort, configPath }) => {
+    // Claude Code's advisor tool: an allowed request model, a blocked advisor's.
+    const withAdvisor = () => post(proxyPort, '/v1/messages', {
+      model: 'claude-zz-allowed', max_tokens: 1, messages: [],
+      tools: [{ type: 'advisor_20260301', name: 'advisor', model: 'claude-zz-blocked' }],
+    });
+    await editConfig(configPath, c => { c.blockedModels = ['*zz-blocked*']; });
+    await reload(proxyPort);
+    let res = await withAdvisor();
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(hits.length, 1, 'setup: without the flag the advisor is not matched');
+
+    await editConfig(configPath, c => { c.blockedModelsMatchAdvisor = true; });
+    await reload(proxyPort);
+    res = await withAdvisor();
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.equal(res.body.error.message, 'Advisor model "claude-zz-blocked" is blocked by teamclaude (matched "*zz-blocked*"). Choose another advisor model, or turn the advisor off.');
+    assert.equal(hits.length, 1, `a blocked advisor must not be forwarded, but the stub saw ${hits.length} hit(s)`);
+
+    // Absent on disk is off again, not the last value the server saw.
+    await editConfig(configPath, c => { delete c.blockedModelsMatchAdvisor; });
+    await reload(proxyPort);
+    res = await withAdvisor();
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(hits.length, 2);
+  });
+});

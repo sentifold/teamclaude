@@ -121,6 +121,8 @@ In both modes, no account able to serve the advisor at all means main-model-only
 
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
+The list is matched against the request's `model`. An advisor's model is left alone by default: when no account can serve it, the advisor degrades as described above instead of hanging the pipeline. If you block a model your accounts *can* serve, to keep it from running at all, that model still runs as the advisor of an allowed one. Set [`blockedModelsMatchAdvisor`](configuration.md#fields) to `true` to refuse such requests too, with a `400` that names the advisor's model. Because the advisor is declared on every request, that refuses all of the client's requests until its advisor setting changes.
+
 ## Model routes
 
 Per-model quota is respected automatically, so most setups need nothing here. To go further you can pin model patterns to an **exclusive** set of accounts with a `routes` table. Each route matches the request's `model` id against shell-style globs (`*` is the only wildcard) and, on the **first matching** route, restricts the request to the listed accounts:

@@ -1589,15 +1589,34 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // once it left base plans) otherwise gets rate-limited upstream and hangs
       // the pipeline; a fast, non-retryable 400 lets the client move on. Read
       // live from the shared config so the TUI editor takes effect immediately.
-      const blockedBy = model ? (config?.blockedModels || []).find((p) => modelGlobMatches(p, model)) : null;
-      if (blockedBy) {
+      //
+      // The advisor's model is matched only when blockedModelsMatchAdvisor is
+      // set. Left alone by default: an advisor on a model no account can serve
+      // already degrades gracefully (issue #98: upstream fails the advisor's
+      // sub-inference and Claude Code may turn the advisor off for the
+      // session), and Claude Code declares the advisor on every request, so
+      // refusing it refuses all of that client's traffic. The flag is for a
+      // blocked model the accounts CAN serve, which would otherwise run as the
+      // advisor of an allowed one.
+      /** @type {string[]} */
+      const blockedModels = config?.blockedModels || [];
+      const blockedBy = model ? blockedModels.find((p) => modelGlobMatches(p, model)) : null;
+      const advisorBlockedBy = !blockedBy && advisorModel && config?.blockedModelsMatchAdvisor === true
+        ? blockedModels.find((p) => modelGlobMatches(p, advisorModel))
+        : null;
+      if (blockedBy || advisorBlockedBy) {
         if (!res.headersSent) {
+          const message = blockedBy
+            ? `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").`
+            : `Advisor model "${advisorModel}" is blocked by teamclaude (matched "${advisorBlockedBy}"). Choose another advisor model, or turn the advisor off.`;
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }));
         }
         recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
         openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
+        // The row names the model that was blocked, which for the advisor is
+        // not the request's own `model`.
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model: blockedBy ? model : `advisor ${advisorModel}`, sessionId });
         return;
       }
 

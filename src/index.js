@@ -615,6 +615,8 @@ async function serverCommand() {
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
+    // Read per request beside the list (server.js), so absent on disk is off again.
+    config.blockedModelsMatchAdvisor = diskConfig.blockedModelsMatchAdvisor === true;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.

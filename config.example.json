@@ -19,6 +19,7 @@
   "synthesizeQuotaHeaders": false,
   "distributeSessions": false,
   "advisorEligibility": "strict",
+  "blockedModelsMatchAdvisor": false,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
   "autoRedeemResets": false,
