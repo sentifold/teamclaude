@@ -291,6 +291,74 @@ test('the TLS handshake over a tunnel is bounded', T, async () => {
   } finally { closeHard(silent); }
 });
 
+// ── A tunnel outlives its handoff ────────────────────────────
+//
+// connectThroughProxy and handshakeOverTunnel used to drop their 'error'
+// listener the moment they resolved, so the socket they hand over had none
+// until the caller added its own, and a socket that errors with nobody
+// listening throws: the process exits, with every session in it. Today's
+// callers add theirs before the next I/O callback, so this is the contract
+// rather than a crash they hit: a caller may hold the socket across an I/O
+// turn. These tests do exactly that — the socket is resumed and never given a
+// listener — and have the proxy reset the tunnel. 'close' is awaited by hand:
+// events.once() would add an 'error' listener of its own and hide exactly what
+// is under test.
+
+// A CONNECT proxy whose tunnels the test can cut. drop() resets the client
+// side, as a proxy or NAT dropping the connection does, and closes the far
+// side so nothing is left open behind the test.
+function droppableConnectProxy() {
+  const tunnels = [];
+  const srv = net.createServer((client) => {
+    client.on('error', () => {});
+    client.once('data', (buf) => {
+      const [host, port] = buf.toString('latin1').split(' ')[1].split(':');
+      const up = net.connect({ port: Number(port), host, autoSelectFamily: true }, () => {
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        up.pipe(client); client.pipe(up);
+      });
+      up.on('error', () => client.destroy());
+      tunnels.push({ client, up });
+    });
+  });
+  const drop = () => { for (const { client, up } of tunnels) { up.destroy(); client.resetAndDestroy(); } };
+  return { srv, drop };
+}
+
+test('a reset on a CONNECT tunnel after the handoff closes the socket, not the process', T, async () => {
+  const target = net.createServer((s) => s.on('error', () => {}));
+  const targetPort = await listen(target);
+  const { srv: proxy, drop } = droppableConnectProxy();
+  const proxyPort = await listen(proxy);
+  try {
+    const sock = await connectThroughProxy({ proxyHost: '127.0.0.1', proxyPort, targetHost: '127.0.0.1', targetPort });
+    sock.resume();
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    drop();
+    await closed;
+    assert.equal(sock.destroyed, true);
+  } finally { closeHard(proxy); closeHard(target); }
+});
+
+test('a reset under a TLS tunnel after the handshake closes the socket, not the process', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const target = tls.createServer({ key: leafKeyPem, cert: leafCertPem }, (s) => s.on('error', () => {}));
+  const targetPort = await listen(target);
+  const { srv: proxy, drop } = droppableConnectProxy();
+  const proxyPort = await listen(proxy);
+  try {
+    const sock = await tunnelTls({
+      proxy: { host: '127.0.0.1', port: proxyPort, username: null, password: null },
+      targetHost: 'localhost', targetPort, tlsOptions: { ca: caCertPem },
+    });
+    sock.resume();
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    drop();
+    await closed;
+    assert.equal(sock.destroyed, true);
+  } finally { closeHard(proxy); closeHard(target); }
+});
+
 // ── SX_API_BASE ──────────────────────────────────────────────
 //
 // The sx.org key rides in the query string, so the base URL decides whether it

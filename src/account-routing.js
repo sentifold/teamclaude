@@ -300,7 +300,6 @@ function connectThroughSocks5({ proxy, targetHost, targetPort, timeout, label })
     const cleanup = () => {
       clearTimeout(timer);
       sock.removeListener('data', onData);
-      sock.removeListener('error', fail);
       sock.removeListener('close', onClose);
     };
     /** @param {any} err */
@@ -378,7 +377,8 @@ function connectThroughSocks5({ proxy, targetHost, targetPort, timeout, label })
       }, fail);
     });
     sock.on('data', onData);
-    sock.once('error', fail);
+    // Kept past the handoff, as connectThroughProxy's is (see sx.js).
+    sock.on('error', fail);
   });
 }
 
@@ -407,7 +407,6 @@ function connectThroughSocks4({ proxy, targetHost, targetPort, timeout, label })
     const cleanup = () => {
       clearTimeout(timer);
       sock.removeListener('data', onData);
-      sock.removeListener('error', fail);
       sock.removeListener('close', onClose);
     };
     /** @param {any} err */
@@ -435,7 +434,8 @@ function connectThroughSocks4({ proxy, targetHost, targetPort, timeout, label })
       buildSocks4Request({ proxy, targetHost, targetPort, label }).then((req) => sock.write(req), fail);
     });
     sock.on('data', onData);
-    sock.once('error', fail);
+    // Kept past the handoff, as connectThroughProxy's is (see sx.js).
+    sock.on('error', fail);
   });
 }
 

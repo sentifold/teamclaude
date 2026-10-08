@@ -111,8 +111,14 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
     const cleanup = () => {
       clearTimeout(timer);
       sock.removeListener('data', onData);
-      sock.removeListener('error', fail);
     };
+    // fail() stays the socket's 'error' listener for its whole life, not just
+    // the CONNECT exchange. Until the caller adds its own, nothing else
+    // listens, and a socket that errors with nobody listening throws: the
+    // process goes down with every session in it. Today's callers add theirs
+    // before the next I/O callback; a caller that holds the socket longer
+    // stays safe too. Once resolved, reject() is a no-op, and the caller still
+    // gets the error on its own listener.
     const fail = (err) => { cleanup(); sock.destroy(); reject(err); };
     const onData = (chunk) => {
       buf += chunk.toString('latin1');
@@ -134,7 +140,7 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
       sock.write(lines.join('\r\n'));
     });
     sock.on('data', onData);
-    sock.once('error', fail);
+    sock.on('error', fail);
   });
 }
 
@@ -150,14 +156,16 @@ export function connectThroughProxy({ proxyHost, proxyPort, auth, targetHost, ta
 export function handshakeOverTunnel(sock, { servername, tlsOptions = {}, timeout = CONNECT_TIMEOUT_MS }) {
   return new Promise((resolve, reject) => {
     const tlsSock = tls.connect({ socket: sock, servername, ...tlsOptions });
-    const settle = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); tlsSock.removeListener('error', onErr); };
-    // On failure nothing will listen to the dying TLSSocket any more, so give it
-    // a sink: a late error from the teardown must not become an uncaught one.
-    const onErr = (err) => { settle(); tlsSock.on('error', () => {}); tlsSock.destroy(); sock.destroy(); reject(err); };
+    const settle = () => { clearTimeout(timer); tlsSock.removeListener('secureConnect', onOk); };
+    // Stays attached for the TLSSocket's whole life, as connectThroughProxy's
+    // does for the tunnel under it: a late error from a failed handshake's
+    // teardown, or a reset before the caller listens, closes this tunnel
+    // instead of throwing. After secureConnect, reject() is a no-op.
+    const onErr = (err) => { settle(); tlsSock.destroy(); sock.destroy(); reject(err); };
     const onOk = () => { settle(); resolve(tlsSock); };
     const timer = setTimeout(() => onErr(new Error(`TLS handshake with ${servername} through the tunnel timed out after ${timeout}ms`)), timeout);
     tlsSock.once('secureConnect', onOk);
-    tlsSock.once('error', onErr);
+    tlsSock.on('error', onErr);
   });
 }
 

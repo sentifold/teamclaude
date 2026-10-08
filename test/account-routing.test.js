@@ -400,6 +400,35 @@ test('socks4: an IPv4 literal goes direct in the address field', T, async () => 
   } finally { closeHard(srv); closeHard(origin); }
 });
 
+// The SOCKS connectors hand their socket off the way connectThroughProxy does,
+// and used to drop their 'error' listener at that point too (see the matching
+// tests in sx.test.js). The socket is resumed with no listener of the test's
+// own and 'close' is awaited by hand, so an error nobody handles fails the
+// test.
+for (const scheme of ['socks5', 'socks4']) {
+  test(`a reset on a ${scheme} tunnel after the handoff closes the socket, not the process`, T, async () => {
+    const held = new Set();
+    const target = net.createServer((s) => { held.add(s); s.on('error', () => {}); });
+    const targetPort = await listen(target);
+    const { srv } = scheme === 'socks5' ? makeSocks5Server() : makeSocks4Server();
+    const conns = [];
+    srv.on('connection', (c) => conns.push(c));
+    const proxyPort = await listen(srv);
+    try {
+      const sock = await connectThroughRouting(parseRoutingUrl(`${scheme}://127.0.0.1:${proxyPort}`),
+        { targetHost: '127.0.0.1', targetPort });
+      sock.resume();
+      const closed = new Promise((resolve) => sock.on('close', resolve));
+      for (const c of conns) c.resetAndDestroy();
+      await closed;
+      assert.equal(sock.destroyed, true);
+    } finally {
+      for (const s of held) s.destroy();
+      closeHard(srv); closeHard(target);
+    }
+  });
+}
+
 // ── HTTP CONNECT and TLS ─────────────────────────────────────
 
 test('http routing uses a CONNECT tunnel with Basic auth', T, async () => {
