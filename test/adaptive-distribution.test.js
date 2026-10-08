@@ -343,6 +343,20 @@ test('adaptive never routes across a priority tier', () => {
   assert.equal(counts.backup, undefined, `priority must be absolute, got ${JSON.stringify(counts)}`);
 });
 
+test('adaptive breaks an exact score and weekly tie on the sooner 5-hour reset', () => {
+  const now = Date.now();
+  const am = mgr(['a', 'b', 'c']);
+  const [a, b, c] = am.accounts;
+  // The same weekly spend and no load, so all three score alike. a and b also
+  // share a weekly reset; c's 5-hour window resets soonest, but its weekly later.
+  for (const [acc, weeklyHours, sessionHours] of [[a, 72, 4], [b, 72, 1], [c, 120, 0.25]]) {
+    acc.quota.unified7d = 0.5; acc.quota.unified7dReset = now + weeklyHours * H;
+    acc.quota.unified5h = 0.3; acc.quota.unified5hReset = now + sessionHours * H;
+    acc.probing = false;
+  }
+  assert.equal(am.getActiveAccount(null, null, null, 's1').name, 'b');
+});
+
 test('adaptive skips an unavailable account entirely', () => {
   const am = mgr(['a', 'b']);
   weekly(am, 0, 0.999); // past the threshold — out of rotation

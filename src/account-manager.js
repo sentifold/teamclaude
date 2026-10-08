@@ -1857,16 +1857,22 @@ export class AccountManager {
     let best = null;
     let bestScore = -Infinity;
     let bestReset = Infinity;
+    let bestSessionReset = Infinity;
     for (const c of candidates) {
       const { score } = scoreCandidate({ ...c, maxRemaining });
-      // Soonest weekly reset breaks a tie, matching the rest of selection: on
-      // an idle fleet every candidate scores identically, and without this the
-      // winner would be array order.
+      // Soonest weekly reset breaks a tie, then soonest 5-hour reset on an
+      // exact weekly tie, matching the rest of selection: on an idle fleet every
+      // candidate scores identically, and without this the winner would be
+      // array order.
       const reset = this._governingWeeklyReset(c.account, model) || -Infinity;
-      if (score > bestScore || (score === bestScore && reset < bestReset)) {
+      const sessionReset = this._rankedSessionReset(c.account, reset, now);
+      if (score > bestScore
+          || (score === bestScore && reset < bestReset)
+          || (score === bestScore && reset === bestReset && sessionReset < bestSessionReset)) {
         best = c.account;
         bestScore = score;
         bestReset = reset;
+        bestSessionReset = sessionReset;
       }
     }
     return bestScore > 0 ? best : null;
@@ -1876,7 +1882,9 @@ export class AccountManager {
    * spread across equal-priority accounts instead of funnelling onto one. Order:
    * priority → [top pressure band, when expiry routing is on] → fewest active
    * sessions → fewest in-flight → highest expiry pressure (inert when expiry
-   * routing is off) → soonest weekly reset (the existing tiebreak). */
+   * routing is off) → soonest weekly reset (the existing tiebreak) → on an
+   * exact weekly tie, soonest 5-hour reset (`_rankedSessionReset`, the same last
+   * key `_pickBestAvailable` compares). */
   _pickLeastLoadedEven(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
@@ -1894,6 +1902,7 @@ export class AccountManager {
     let bestInFlight = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
+    let bestSessionReset = Infinity;
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const heldOff = spent[i];
@@ -1901,14 +1910,17 @@ export class AccountManager {
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
       const reset = this._rankedReset(account, model);
+      const sessionReset = this._rankedSessionReset(account, reset, now);
       const samePriority = priority === bestPriority;
       const sameSpend = samePriority && heldOff === bestSpent;
+      const sameLoad = sameSpend && sessions === bestSessions && inFlight === bestInFlight;
       if (priority < bestPriority
         || (samePriority && heldOff < bestSpent)
         || (sameSpend && sessions < bestSessions)
         || (sameSpend && sessions === bestSessions && inFlight < bestInFlight)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure < bestPressure)
-        || (sameSpend && sessions === bestSessions && inFlight === bestInFlight && pressure === bestPressure && reset < bestReset)) {
+        || (sameLoad && pressure < bestPressure)
+        || (sameLoad && pressure === bestPressure && reset < bestReset)
+        || (sameLoad && pressure === bestPressure && reset === bestReset && sessionReset < bestSessionReset)) {
         best = account;
         bestPriority = priority;
         bestSpent = heldOff;
@@ -1916,6 +1928,7 @@ export class AccountManager {
         bestInFlight = inFlight;
         bestPressure = pressure;
         bestReset = reset;
+        bestSessionReset = sessionReset;
       }
     });
     return best;
@@ -2981,8 +2994,9 @@ export class AccountManager {
   }
 
   /**
-   * The reset both selection loops break an otherwise-exact tie on, and unknown
-   * sorts first either way. With expiry routing on it is the governing window's
+   * The weekly reset both selection loops break an otherwise-exact tie on, and
+   * unknown sorts first either way. An exact tie on it goes one key further, to
+   * `_rankedSessionReset`. With expiry routing on it is the governing window's
    * own reset, the one the gate and the ratio just used: `_governingWeeklyReset`
    * prefers the named `${bucket}Reset`, which for a family metered by a learned
    * scoped bucket is the shared weekly — a clock nothing else in the decision
@@ -3003,6 +3017,31 @@ export class AccountManager {
   _rankingReset(account, model) {
     if (!this.expiryRouting.enabled) return this._governingWeeklyReset(account, model);
     return this._governingWindow(account, model).resetAt ?? null;
+  }
+
+  /**
+   * The last key selection compares, read only on an exact tie of the weekly
+   * reset before it: when the account's 5-hour window resets, sooner first. The
+   * weekly rule one window down: session quota that lapses soonest is spent
+   * first. Shared by both selection loops and adaptive's score tie, so none
+   * breaks that tie differently.
+   *
+   * Infinity, which sorts last, for an account with no 5-hour window open and
+   * for one whose reset has already passed: none of its session quota is about
+   * to lapse. A passed reset can still be here, because `_clearExpiredQuotas`
+   * clears one only when a reading sits beside it. The TUI's `session-reset`
+   * sort ranks the same way. Infinity too while `weeklyReset` is not known (the
+   * caller's -Infinity), so between two accounts with no known weekly reset the
+   * probe-first order stays exactly as it was: config order decides.
+   * @param {Record<string, any>} account
+   * @param {number} weeklyReset this account's weekly reset as the caller ranks it
+   * @param {number} now the pass's one clock
+   * @returns {number}
+   */
+  _rankedSessionReset(account, weeklyReset, now) {
+    if (!Number.isFinite(weeklyReset)) return Infinity;
+    const reset = account.quota.unified5hReset;
+    return Number.isFinite(reset) && reset > now ? reset : Infinity;
   }
 
   /**
@@ -3864,9 +3903,12 @@ export class AccountManager {
       if (!best) { best = acc; continue; }
       const mine = rankOf.get(acc.index);
       const theirs = rankOf.get(best.index);
-      // Highest pressure, then soonest reset — the same order the pick uses,
-      // through the same function, so the two cannot disagree about which of two
-      // accounts is worth more.
+      // Highest pressure, then soonest weekly reset — the order the pick uses,
+      // through the same functions, so the two cannot disagree about which of
+      // two accounts is worth more. The pick's last key, the 5-hour reset
+      // (`_rankedSessionReset`), is left out: an account reaches this list
+      // because its 5-hour window cleared, so it normally has no window open for
+      // that key to order, and the switch stays exactly as it was.
       if (mine < theirs
         || (mine === theirs && this._rankedReset(acc, model) < this._rankedReset(best, model))) best = acc;
     }
@@ -3945,18 +3987,26 @@ export class AccountManager {
    *   4. then the account whose weekly limit expires soonest: that quota is
    *      closest to refreshing, so spending it first preserves accounts whose
    *      weekly window resets further out.
+   *   5. then, on an exact tie of a known weekly reset, the account whose 5-hour
+   *      window resets soonest, for the same reason one window down. An account
+   *      with no 5-hour window open sorts after one that has: none of its
+   *      session quota is about to lapse. A tie of two unknown weekly resets is
+   *      left to step 2 and config order (`_rankedSessionReset`).
    * With expiry routing off, step 3 is absent for every account and this reduces
-   * to the weekly-reset heuristic. Returns the account or null if none are
-   * available. Step 3 generalises step 4: at equal headroom soonest reset is
+   * to the reset heuristic of steps 4 and 5. Returns the account or null if none
+   * are available. Step 3 generalises step 4: at equal headroom soonest reset is
    * highest pressure, and the two part only where a timestamp alone would rank a
    * nearly-drained account resetting in an hour over one holding 20x the quota
-   * that expires in ten.
+   * that expires in ten. Step 5 stays a bare timestamp: it orders only a tie that
+   * config order used to settle, among accounts `_isAvailable` has already kept
+   * under their 5-hour threshold.
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestPriority = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
+    let bestSessionReset = Infinity;
 
     const candidates = this._bandedCandidates(exclude, model, advisorModel);
     // One clock for every candidate, as in _pickLeastLoaded.
@@ -3971,12 +4021,17 @@ export class AccountManager {
       // refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._rankedReset(account, model);
+      const sessionReset = this._rankedSessionReset(account, weeklyReset, now);
+      const samePriority = priority === bestPriority;
+      const samePressure = samePriority && pressure === bestPressure;
       if (priority < bestPriority
-          || (priority === bestPriority && pressure < bestPressure)
-          || (priority === bestPriority && pressure === bestPressure && weeklyReset < bestReset)) {
+          || (samePriority && pressure < bestPressure)
+          || (samePressure && weeklyReset < bestReset)
+          || (samePressure && weeklyReset === bestReset && sessionReset < bestSessionReset)) {
         bestPriority = priority;
         bestPressure = pressure;
         bestReset = weeklyReset;
+        bestSessionReset = sessionReset;
         best = account;
       }
     });

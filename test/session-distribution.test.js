@@ -69,6 +69,25 @@ test('distribution on: three sessions spread across three accounts', () => {
   assert.deepEqual([...seen].sort(), ['a', 'b', 'c']);
 });
 
+test('distribution on: an exact weekly tie between idle accounts goes to the sooner 5-hour reset', () => {
+  const now = Date.now();
+  const am = mgr(['a', 'b', 'c'], { distributeSessions: true });
+  const [a, b, c] = am.accounts;
+  // a and b reset their weekly window at the same moment and b's 5-hour window
+  // resets first. c's 5-hour window resets soonest of all, but its weekly later.
+  for (const [acc, weeklyHours, sessionHours] of [[a, 72, 4], [b, 72, 1], [c, 120, 0.25]]) {
+    acc.quota.unified7d = 0.4; acc.quota.unified7dReset = now + weeklyHours * H;
+    acc.quota.unified5h = 0.3; acc.quota.unified5hReset = now + sessionHours * H;
+    acc.probing = false;
+  }
+  // Nothing is loaded yet, so the resets decide where the first conversation goes.
+  const s1 = am.getActiveAccount(null, null, null, 'sess-1');
+  am.recordSession('sess-1', s1.index);
+  assert.equal(s1.name, 'b');
+  // The 5-hour reset only breaks a tie: load still spreads the next one.
+  assert.equal(am.getActiveAccount(null, null, null, 'sess-2').name, 'a');
+});
+
 test('distribution on: priority still wins over session load-balancing', () => {
   const am = new AccountManager([
     oauth('a', { priority: 0 }),

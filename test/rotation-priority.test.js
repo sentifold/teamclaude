@@ -39,6 +39,82 @@ test('within the same priority, the existing heuristic breaks the tie', () => {
   assert.equal(am._selectNext().name, 'b');
 });
 
+test('an exact weekly tie goes to the account whose 5-hour window resets sooner', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c')], 0.98);
+  const [a, b, c] = am.accounts;
+  // a and b reset their weekly window at the same moment; b's 5-hour window
+  // resets first, so its session quota is the one about to lapse.
+  a.quota.unified7dReset = now + 3 * 86400_000;
+  a.quota.unified5h = 0.3; a.quota.unified5hReset = now + 4 * 3600_000;
+  b.quota.unified7dReset = now + 3 * 86400_000;
+  b.quota.unified5h = 0.3; b.quota.unified5hReset = now + 3600_000;
+  // c's 5-hour window resets soonest of all, but its weekly one resets later:
+  // the 5-hour reset only breaks a weekly tie, it never outranks the weekly.
+  c.quota.unified7dReset = now + 5 * 86400_000;
+  c.quota.unified5h = 0.3; c.quota.unified5hReset = now + 600_000;
+  // Config order alone picks a. Comparing 5-hour resets without the weekly tie
+  // (or ranking them ahead of the weekly) picks c.
+  assert.equal(am._selectNext().name, 'b');
+});
+
+test('on an exact weekly tie, an account with no 5-hour window open goes after one that has', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a'), oauth('c'), oauth('d'), oauth('b')], 0.98);
+  const [a, , d, b] = am.accounts;
+  for (const acc of am.accounts) acc.quota.unified7dReset = now + 3 * 86400_000;
+  // None of a, c, d has session quota about to lapse. c never opened a window;
+  // a's has already reset; d holds a reset that has passed with no reading
+  // beside it, which nothing clears, so the ranking must not take it as soonest.
+  a.quota.unified5h = 0.9; a.quota.unified5hReset = now - 60_000;
+  d.quota.unified5hReset = now - 60_000;
+  // b's window is open and ends in two hours.
+  b.quota.unified5h = 0.5; b.quota.unified5hReset = now + 2 * 3600_000;
+  assert.equal(am._selectNext().name, 'b');
+});
+
+test('with no weekly reset known, the 5-hour reset breaks no tie and config order decides', () => {
+  const now = Date.now();
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  // Neither weekly reset is known, so both sort first to be probed. b has a
+  // 5-hour window open and a does not; the probe-first order stays as it was.
+  am.accounts[1].quota.unified5h = 0.3;
+  am.accounts[1].quota.unified5hReset = now + 3600_000;
+  assert.equal(am._selectNext().name, 'a');
+});
+
+test('the 5-hour reset never outranks priority', () => {
+  const now = Date.now();
+  // a comes first, so a 5-hour key compared without the priority guard would
+  // replace it with b on b's sooner window.
+  const am = new AccountManager([oauth('a', { priority: 0 }), oauth('b', { priority: 1 })], 0.98);
+  const [a, b] = am.accounts;
+  for (const acc of am.accounts) acc.quota.unified7dReset = now + 3 * 86400_000;
+  a.quota.unified5h = 0.3; a.quota.unified5hReset = now + 4 * 3600_000;
+  b.quota.unified5h = 0.3; b.quota.unified5hReset = now + 600_000;
+  assert.equal(am._selectNext().name, 'a');
+});
+
+test('the 5-hour reset never outranks expiry pressure', () => {
+  const fleet = (usedA, usedB) => {
+    const now = Date.now();
+    const am = new AccountManager([oauth('a'), oauth('b')], 0.98, { expiryRouting: { enabled: true } });
+    const [a, b] = am.accounts;
+    // The same weekly reset, so pressure differs only by weekly headroom; both
+    // stay inside the default band, so b is a candidate either way.
+    a.quota.unified7d = usedA; a.quota.unified7dReset = now + 3 * 86400_000;
+    b.quota.unified7d = usedB; b.quota.unified7dReset = now + 3 * 86400_000;
+    a.quota.unified5h = 0.3; a.quota.unified5hReset = now + 4 * 3600_000;
+    b.quota.unified5h = 0.3; b.quota.unified5hReset = now + 600_000;
+    return am;
+  };
+  // Equal pressure: the tie reaches the 5-hour reset, and b's is sooner.
+  assert.equal(fleet(0.2, 0.2)._selectNext().name, 'b');
+  // a holds more weekly headroom against the same clock, so it has the higher
+  // pressure and wins before the 5-hour reset is read.
+  assert.equal(fleet(0.2, 0.3)._selectNext().name, 'a');
+});
+
 test('priority is respected even when a higher-priority account is also available', () => {
   const am = new AccountManager([
     oauth('a', { priority: 0 }),
