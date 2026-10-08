@@ -4,6 +4,14 @@ import http from 'node:http';
 import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, upgradeTarget } from '../src/server.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// These send requests to local origins, and both the relays and the
+// forwarding path follow upstreamProxy, which falls back to HTTPS_PROXY /
+// ALL_PROXY: opt out, or an exported proxy takes them somewhere else
+// (test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // relayUpgrade built its target as `new URL(upstream + req.url)`. With an
 // upstream that carries a port and a request target that is not a plain path

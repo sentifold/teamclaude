@@ -3,6 +3,14 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// These send requests to local origins, and both the relays and the
+// forwarding path follow upstreamProxy, which falls back to HTTPS_PROXY /
+// ALL_PROXY: opt out, or an exported proxy takes them somewhere else
+// (test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // What travels upstream on each path, credential-wise. The proxy replaces the
 // client's credential with a fleet account's on the inference path, and relays

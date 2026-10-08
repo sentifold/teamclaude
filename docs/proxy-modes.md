@@ -58,9 +58,11 @@ restart.
 
 - Covers **all** Anthropic-bound traffic: request forwarding, OAuth login, token
   refresh, profile and usage lookups, and (since per-account routing landed)
-  `teamclaude api`, which used to go direct. A proxy that covered only some of
-  them would leave you able to refresh an account but not add one, or the
-  reverse.
+  `teamclaude api`, which used to go direct. The requests relayed with the
+  client's own credential go through it too (Remote Control and its WebSocket,
+  attachment transfers, and a Codex client's own `chatgpt.com` calls); they
+  also used to go direct. A proxy that covered only some of them would leave
+  you able to refresh an account but not add one, or the reverse.
 - `HTTPS_PROXY` / `ALL_PROXY` are picked up automatically when the config sets
   nothing, so a machine already configured for other tools needs no extra setup.
   When that happens the server says so on startup, and the TUI marks the row with

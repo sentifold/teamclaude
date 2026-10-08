@@ -4,6 +4,14 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyRequestListener } from '../src/server.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// These send requests to local origins, and both the relays and the
+// forwarding path follow upstreamProxy, which falls back to HTTPS_PROXY /
+// ALL_PROXY: opt out, or an exported proxy takes them somewhere else
+// (test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // Since Claude Code 2.1.287 `claude remote-control` honours HTTPS_PROXY
 // (anthropics/claude-code#97352), so the bridge's control plane reaches the

@@ -16,6 +16,7 @@ import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
+import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
@@ -1883,6 +1884,37 @@ function sxAgent(sx, targetHost) {
   return agent;
 }
 
+// The relays' direct arm, with the options Node gives its global agent. Not
+// the global agent itself: when the process runs with NODE_USE_ENV_PROXY=1 (or
+// --use-env-proxy), that one tunnels through HTTPS_PROXY by Node's own rules,
+// past `upstreamProxy: false` and `noProxy`, and a CONNECT the proxy refuses
+// leaves the proxy socket open with no 'error' listener, so the proxy's later
+// reset is an uncaught exception that exits the server. An agent created here
+// carries no env proxy, like upstream-fetch.js's pooled agents.
+const relayHttpAgent = new http.Agent({ keepAlive: true, scheduling: 'lifo', timeout: 5000 });
+const relayHttpsAgent = new https.Agent({ keepAlive: true, scheduling: 'lifo', timeout: 5000 });
+
+/**
+ * The agent a client-credential relay (relayStream, relayUpgrade) dials
+ * `target` with, in the order upstream-fetch.js uses: sx.org when it routes
+ * this request, else the upstream proxy when one applies to the host, else a
+ * direct connection.
+ *
+ * The relays used to stop after the first arm and pass no agent, so they
+ * ignored `upstreamProxy`: on a host whose only way out is that proxy, Remote
+ * Control and attachment transfers failed while inference worked.
+ * @param {URL} target
+ * @param {import('./sx.js').SxManager | null | undefined} sx
+ * @returns {import('node:http').Agent}
+ */
+function relayAgent(target, sx) {
+  if (sx?.useByDefault() && sx.isProvisioned()) return sxAgent(sx, target.hostname);
+  const useTls = target.protocol !== 'http:';
+  const proxy = proxyForHost(target.hostname);
+  if (!proxy) return useTls ? relayHttpsAgent : relayHttpAgent;
+  return proxyAgent(proxy, { targetHost: target.hostname, targetPort: Number(target.port) || (useTls ? 443 : 80), tls: useTls });
+}
+
 /**
  * Relay a request to upstream with the client's OWN headers intact (including
  * its authorization) — used for Remote Control (/v1/code/*), whose event
@@ -1905,8 +1937,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
     headers[key] = value;
   }
 
-  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
-  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const agent = relayAgent(target, sx);
   const transport = target.protocol === 'http:' ? http : https;
 
   const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
@@ -2057,8 +2088,7 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     headers[key] = value;
   }
 
-  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
-  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const agent = relayAgent(target, sx);
   // One module's signature stands for both: the options this call passes are
   // the same for http and https, and a union of the two `request` overload sets
   // is not callable as such.

@@ -9,6 +9,14 @@ import { allowLoopbackForward } from '../src/forward-target.js';
 import { createProxyServer, createProxyRequestListener, relayUpgrade, isOverageHeader } from '../src/server.js';
 import { createConnectHandler } from '../src/mitm.js';
 import { generateCertChain } from '../src/x509.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// These send requests to local origins, and both the relays and the
+// forwarding path follow upstreamProxy, which falls back to HTTPS_PROXY /
+// ALL_PROXY: opt out, or an exported proxy takes them somewhere else
+// (test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // Claude Code caches the `anthropic-ratelimit-unified-overage-*` family (and
 // `upgrade-paths`) as its own org's billing state. In a pool whose accounts

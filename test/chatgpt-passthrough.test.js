@@ -9,6 +9,14 @@ import { createConnectHandler } from '../src/mitm.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyRequestListener, clientPassthroughOrigin } from '../src/server.js';
 import { allowLoopbackForward } from '../src/forward-target.js';
+import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
+
+// These send requests to local origins, and both the relays and the
+// forwarding path follow upstreamProxy, which falls back to HTTPS_PROXY /
+// ALL_PROXY: opt out, or an exported proxy takes them somewhere else
+// (test/README.md).
+test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
+test.afterEach(() => resetUpstreamProxy());
 
 // With Codex accounts in the pool the MITM intercepts all of chatgpt.com, but the
 // request path routes by its PATH alone: /backend-api/codex/* is Codex and
